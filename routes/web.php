@@ -19,6 +19,9 @@ Route::middleware('auth')->group(function () {
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
     Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
+
+    Route::get('/ai-clipper', [\App\Http\Controllers\AiClipperController::class, 'index'])->name('ai-clipper.index');
+    Route::post('/ai-clipper/process', [\App\Http\Controllers\AiClipperController::class, 'store'])->name('ai-clipper.store');
 });
 
 require __DIR__ . '/auth.php';
