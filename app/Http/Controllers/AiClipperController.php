@@ -42,18 +42,30 @@ class AiClipperController extends Controller
         ]);
 
         // 2. "Tendang" Bola ke n8n
+        // 2. "Tendang" Bola ke n8n
         try {
-            Http::withHeaders([
+            $response = Http::withHeaders([
                 'x-api-key' => '123456'
-            ])->post('https://n8n.dimascndraa.me/webhook/autoclip', [
+            ])->post('https://n8n.dimascndraa.me/webhook/autoclip', [ // Pastikan URL ini benar
                 'url' => $request->url,
                 'task_id' => $task->id,
             ]);
 
+            // === TAMBAHAN LOGIC CEK ERROR ===
+            if ($response->failed()) {
+                // Jika n8n membalas error (misal 404 atau 500)
+                $task->update(['status' => 'failed']);
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Gagal request ke n8n. Status: ' . $response->status(),
+                    'debug' => $response->body() // Ini akan kasih tau pesan error aslinya
+                ], 500);
+            }
+
             return response()->json(['status' => 'success', 'message' => 'AI sedang bekerja...', 'task' => $task]);
         } catch (\Exception $e) {
             $task->update(['status' => 'failed']);
-            return response()->json(['status' => 'error', 'message' => 'Gagal konek ke n8n'], 500);
+            return response()->json(['status' => 'error', 'message' => 'Koneksi Gagal: ' . $e->getMessage()], 500);
         }
     }
 
