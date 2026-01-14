@@ -40,13 +40,13 @@ class AiClipperController extends Controller
         $task = VideoTask::with('clips')->find($id);
 
         if (!$task) {
-            if (request()->wantsJson()) {
+            if (request()->wantsJson() || request()->ajax()) {
                 return response()->json(['error' => 'Task not found'], 404);
             }
             return redirect()->route('ai-clipper.index')->with('error', 'Task not found');
         }
 
-        if (request()->wantsJson()) {
+        if (request()->wantsJson() || request()->ajax()) {
             return response()->json($task);
         }
 
