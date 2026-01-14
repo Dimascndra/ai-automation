@@ -7,4 +7,4 @@ Route::get('/user', function (Request $request) {
     return $request->user();
 })->middleware('auth:sanctum');
 
-Route::post('/webhook/callback', [\App\Http\Controllers\AiClipperController::class, 'handleCallback']);
+Route::post('/ai-clipper/callback', [\App\Http\Controllers\AiClipperController::class, 'handleCallback'])->name('api.ai-clipper.callback');

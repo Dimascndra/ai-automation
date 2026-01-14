@@ -22,6 +22,9 @@ Route::middleware('auth')->group(function () {
 
     Route::get('/ai-clipper', [\App\Http\Controllers\AiClipperController::class, 'index'])->name('ai-clipper.index');
     Route::post('/ai-clipper/process', [\App\Http\Controllers\AiClipperController::class, 'store'])->name('ai-clipper.store');
+    Route::get('/ai-clipper/status/{id}', [\App\Http\Controllers\AiClipperController::class, 'checkStatus'])->name('ai-clipper.status');
+    Route::get('/ai-clipper/{id}', [\App\Http\Controllers\AiClipperController::class, 'show'])->name('ai-clipper.show');
+    Route::get('/ai-clipper/{taskId}/download/{clipNumber}', [\App\Http\Controllers\AiClipperController::class, 'downloadClip'])->name('ai-clipper.download');
 });
 
 require __DIR__ . '/auth.php';

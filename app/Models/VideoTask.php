@@ -12,8 +12,15 @@ class VideoTask extends Model
     protected $fillable = [
         'youtube_url',
         'num_clips',
+        'watermark_path',
         'status',
         'output_filename',
         'ai_summary',
+        'total_clips', // Added
     ];
+
+    public function clips()
+    {
+        return $this->hasMany(VideoClip::class);
+    }
 }
