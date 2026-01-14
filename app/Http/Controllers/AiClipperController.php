@@ -33,21 +33,25 @@ class AiClipperController extends Controller
     {
         $request->validate([
             'url' => 'required|url',
+            'num_clips' => 'nullable|integer|min:1',
         ]);
+
+        $numClips = $request->input('num_clips', 1);
 
         // 1. Simpan Data Awal (Status: Pending)
         $task = VideoTask::create([
             'youtube_url' => $request->url,
+            'num_clips' => $numClips,
             'status' => 'processing'
         ]);
 
-        // 2. "Tendang" Bola ke n8n
         // 2. "Tendang" Bola ke n8n
         try {
             $response = Http::withHeaders([
                 'x-api-key' => '123456'
             ])->post('https://n8n.dimascndraa.me/webhook/autoclip', [ // Pastikan URL ini benar
                 'url' => $request->url,
+                'num_clips' => $numClips,
                 'task_id' => $task->id,
             ]);
 

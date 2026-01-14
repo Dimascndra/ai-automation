@@ -11,6 +11,7 @@ class VideoTask extends Model
 
     protected $fillable = [
         'youtube_url',
+        'num_clips',
         'status',
         'output_filename',
         'ai_summary',

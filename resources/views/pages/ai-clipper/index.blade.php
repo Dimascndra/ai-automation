@@ -29,6 +29,12 @@
                         <input type="url" name="url" class="form-control"
                             placeholder="https://youtube.com/watch?v=..." required>
                     </div>
+                    <div class="form-group">
+                        <label>Number of Clips (Optional)</label>
+                        <input type="number" name="num_clips" class="form-control" placeholder="1" value="1"
+                            min="1" max="10">
+                        <small class="form-text text-muted">How many clips do you want generated from this video?</small>
+                    </div>
                     <button type="submit" class="btn btn-primary" id="btnSubmit">
                         <span class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"
                             id="btnSpinner"></span>
