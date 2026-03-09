@@ -186,6 +186,13 @@ class AiClipperController extends Controller
             $response = $httpClient->post($n8nWebhookUrl, $payload);
 
             if ($response->failed()) {
+                $responseJson = $response->json();
+                $hintMessage = is_array($responseJson) ? ($responseJson['hint'] ?? null) : null;
+                $errorMessage = 'Gagal request ke n8n. Status: ' . $response->status();
+                if ($response->status() === 404 && $hintMessage) {
+                    $errorMessage .= '. ' . $hintMessage;
+                }
+
                 $task->update([
                     'status' => 'failed',
                     'ai_summary' => 'N8N request failed with status ' . $response->status(),
@@ -194,7 +201,7 @@ class AiClipperController extends Controller
 
                 return response()->json([
                     'status' => 'error',
-                    'message' => 'Gagal request ke n8n. Status: ' . $response->status(),
+                    'message' => $errorMessage,
                     'debug' => $response->body()
                 ], 500);
             }
@@ -219,8 +226,37 @@ class AiClipperController extends Controller
      */
     public function handleCallback(Request $request)
     {
+        $payload = $request->all();
+
+        // n8n can send payload as [ { ... } ] or nested under "body".
+        if (isset($payload[0]) && is_array($payload[0])) {
+            $payload = $payload[0];
+        }
+
+        if (isset($payload['body'])) {
+            if (is_array($payload['body'])) {
+                $payload = array_merge($payload, $payload['body']);
+            } elseif (is_string($payload['body'])) {
+                $decodedBody = json_decode($payload['body'], true);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($decodedBody)) {
+                    $payload = array_merge($payload, $decodedBody);
+                }
+            }
+            unset($payload['body']);
+        }
+
+        if (!isset($payload['status']) && isset($payload['clips'])) {
+            $payload['status'] = 'completed';
+        }
+
+        if (!isset($payload['total_clips']) && isset($payload['clips']) && is_array($payload['clips'])) {
+            $payload['total_clips'] = count($payload['clips']);
+        }
+
+        $request->merge($payload);
+
         // Validation
-        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+        $validator = \Illuminate\Support\Facades\Validator::make($payload, [
             'task_id' => 'required|integer|exists:video_tasks,id',
             'status' => 'required|in:completed,failed',
             'total_clips' => 'required_if:status,completed|integer',
@@ -239,11 +275,15 @@ class AiClipperController extends Controller
         ]);
 
         if ($validator->fails()) {
-            Log::warning('N8N Callback Validation Failed', $validator->errors()->toArray());
+            Log::warning('N8N Callback Validation Failed', [
+                'errors' => $validator->errors()->toArray(),
+                'payload' => $payload,
+                'raw' => $request->getContent(),
+            ]);
             return response()->json(['error' => 'Validation failed', 'details' => $validator->errors()], 422);
         }
 
-        $task = VideoTask::find($request->task_id);
+        $task = VideoTask::find($payload['task_id']);
 
         if (!$task) {
             return response()->json(['error' => 'Task not found'], 404);
@@ -251,24 +291,24 @@ class AiClipperController extends Controller
 
         DB::beginTransaction();
         try {
-            if ($request->status === 'failed') {
+            if ($payload['status'] === 'failed') {
                 $task->update([
                     'status' => 'failed',
-                    'ai_summary' => $request->error ?? 'Unknown error from N8N',
-                    'youtube_publish_status' => $request->youtube_publish_status ?? 'failed',
+                    'ai_summary' => $payload['error'] ?? 'Unknown error from N8N',
+                    'youtube_publish_status' => $payload['youtube_publish_status'] ?? 'failed',
                 ]);
             } else {
                 $task->update([
                     'status' => 'completed',
-                    'total_clips' => $request->total_clips,
-                    'ai_summary' => 'Processed ' . $request->total_clips . ' clips.',
-                    'fact_check_notes' => $request->fact_check_notes,
-                    'source_podcast_query' => $request->source_podcast_query,
-                    'youtube_publish_status' => $request->youtube_publish_status ?? 'review_pending',
+                    'total_clips' => $payload['total_clips'],
+                    'ai_summary' => 'Processed ' . $payload['total_clips'] . ' clips.',
+                    'fact_check_notes' => $payload['fact_check_notes'] ?? null,
+                    'source_podcast_query' => $payload['source_podcast_query'] ?? null,
+                    'youtube_publish_status' => $payload['youtube_publish_status'] ?? 'review_pending',
                 ]);
 
                 // Insert Clips
-                foreach ($request->clips as $clipData) {
+                foreach ($payload['clips'] as $clipData) {
                     VideoClip::create([
                         'video_task_id' => $task->id,
                         'clip_number' => $clipData['clip_number'],

@@ -19,7 +19,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const body = $json.body ?? $json;\nconst workflowMode = body.workflow_mode ?? 'auto_trending';\nconst fallbackTopic = body.topic_hint || 'topik hangat hari ini';\n\nconst chosenTopic = workflowMode === 'manual_url'\n  ? `Manual source: ${body.youtube_url || 'unknown url'}`\n  : fallbackTopic;\n\nreturn [{\n  json: {\n    task_id: body.task_id,\n    youtube_url: body.youtube_url,\n    num_clips: Number(body.num_clips || 1),\n    watermark_url: body.watermark_url || null,\n    workflow_mode: workflowMode,\n    topic_hint: body.topic_hint || null,\n    topic: chosenTopic,\n    fact_check_notes: `Topik ${chosenTopic} divalidasi dari beberapa sumber tepercaya.`,\n    source_podcast_query: `podcast ${chosenTopic} indonesia`,\n  }\n}];"
+        "jsCode": "const body = $json.body ?? $json;\nconst workflowMode = body.workflow_mode ?? 'auto_trending';\nconst fallbackTopic = body.topic_hint || 'topik hangat hari ini';\n\nconst chosenTopic = workflowMode === 'manual_url'\n  ? `Manual source: ${body.youtube_url || 'unknown url'}`\n  : fallbackTopic;\n\nreturn [{\n  json: {\n    task_id: body.task_id,\n    youtube_url: body.youtube_url,\n    num_clips: Number(body.num_clips || 1),\n    watermark_url: body.watermark_url || null,\n    callback_url: body.callback_url || 'https://your-laravel-host.com/ai-clipper/callback',\n    workflow_mode: workflowMode,\n    topic_hint: body.topic_hint || null,\n    topic: chosenTopic,\n    fact_check_notes: `Topik ${chosenTopic} divalidasi dari beberapa sumber tepercaya.`,\n    source_podcast_query: `podcast ${chosenTopic} indonesia`,\n  }\n}];"
       },
       "id": "2",
       "name": "Prepare Topic & Fact Check",
@@ -32,7 +32,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const input = $json;\nconst clips = [];\nconst total = Math.min(Math.max(input.num_clips || 1, 1), 10);\n\nfor (let i = 1; i <= total; i++) {\n  const start = (i - 1) * 35;\n  const end = start + 35;\n  clips.push({\n    clip_number: i,\n    title: `${input.topic} - Clip ${i}`,\n    start_time: start,\n    end_time: end,\n    duration: end - start,\n    reason: 'Bagian paling relevan untuk format Shorts.',\n    video_clip_url: `https://example.com/autoclipper/task-${input.task_id || 'demo'}/clip-${i}.mp4`\n  });\n}\n\nreturn [{\n  json: {\n    ...input,\n    clips,\n    total_clips: clips.length,\n    youtube_publish_status: 'review_pending'\n  }\n}];"
+        "jsCode": "const input = $json;\nconst clips = [];\nconst total = Math.min(Math.max(input.num_clips || 1, 1), 10);\nconst callbackUrl = String(input.callback_url || '');\nconst callbackOriginMatch = callbackUrl.match(/^(https?:\\/\\/[^/]+)/i);\nconst callbackOrigin = callbackOriginMatch ? callbackOriginMatch[1] : 'https://clipper.dimascndraa.me';\nconst clipBaseUrl = input.clip_base_url || `${callbackOrigin}/storage/autoclipper`;\n\nfor (let i = 1; i <= total; i++) {\n  const start = (i - 1) * 35;\n  const end = start + 35;\n  const providedUrl = input.clips?.[i - 1]?.video_clip_url || null;\n\n  clips.push({\n    clip_number: i,\n    title: `${input.topic} - Clip ${i}`,\n    start_time: start,\n    end_time: end,\n    duration: end - start,\n    reason: 'Bagian paling relevan untuk format Shorts.',\n    video_clip_url: providedUrl || `${clipBaseUrl}/task-${input.task_id || 'demo'}/clip-${i}.mp4`\n  });\n}\n\nreturn [{\n  json: {\n    ...input,\n    clips,\n    total_clips: clips.length,\n    youtube_publish_status: 'review_pending'\n  }\n}];"
       },
       "id": "3",
       "name": "Generate Clips Payload",
@@ -61,10 +61,10 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://your-laravel-host.com/ai-clipper/callback",
+        "url": "={{$json.callback_url}}",
         "sendBody": true,
         "contentType": "json",
-        "jsonBody": "={\n  \"task_id\": {{$json.task_id}},\n  \"status\": \"completed\",\n  \"total_clips\": {{$json.total_clips}},\n  \"fact_check_notes\": \"{{$json.fact_check_notes}}\",\n  \"source_podcast_query\": \"{{$json.source_podcast_query}}\",\n  \"youtube_publish_status\": \"review_pending\",\n  \"clips\": {{$json.clips}}\n}",
+        "jsonBody": "={{ {\n  task_id: $json.task_id,\n  status: 'completed',\n  total_clips: $json.total_clips,\n  fact_check_notes: $json.fact_check_notes,\n  source_podcast_query: $json.source_podcast_query,\n  youtube_publish_status: $json.youtube_publish_status || 'review_pending',\n  clips: $json.clips\n} }}",
         "options": {}
       },
       "id": "5",
