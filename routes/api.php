@@ -8,3 +8,4 @@ Route::get('/user', function (Request $request) {
 })->middleware('auth:sanctum');
 
 Route::post('/ai-clipper/callback', [\App\Http\Controllers\AiClipperController::class, 'handleCallback'])->name('api.ai-clipper.callback');
+Route::post('/ai-clipper/render-upload', [\App\Http\Controllers\AiClipperController::class, 'renderAndUpload'])->name('api.ai-clipper.render-upload');

@@ -1,5 +1,5 @@
 {
-  "name": "AutoClipper YouTube Shorts - Trending to Review Pending",
+  "name": "AutoClipper YouTube Shorts - Render Upload Production",
   "nodes": [
     {
       "parameters": {
@@ -19,10 +19,10 @@
     },
     {
       "parameters": {
-        "jsCode": "const body = $json.body ?? $json;\nconst workflowMode = body.workflow_mode ?? 'auto_trending';\nconst fallbackTopic = body.topic_hint || 'topik hangat hari ini';\n\nconst chosenTopic = workflowMode === 'manual_url'\n  ? `Manual source: ${body.youtube_url || 'unknown url'}`\n  : fallbackTopic;\n\nreturn [{\n  json: {\n    task_id: body.task_id,\n    youtube_url: body.youtube_url,\n    num_clips: Number(body.num_clips || 1),\n    watermark_url: body.watermark_url || null,\n    callback_url: body.callback_url || 'https://your-laravel-host.com/ai-clipper/callback',\n    workflow_mode: workflowMode,\n    topic_hint: body.topic_hint || null,\n    topic: chosenTopic,\n    fact_check_notes: `Topik ${chosenTopic} divalidasi dari beberapa sumber tepercaya.`,\n    source_podcast_query: `podcast ${chosenTopic} indonesia`,\n  }\n}];"
+        "jsCode": "const body = $json.body ?? $json;\nconst workflowMode = body.workflow_mode ?? 'auto_trending';\nconst topicHint = body.topic_hint || 'Topik hangat';\nconst numClips = Math.min(Math.max(Number(body.num_clips || 1), 1), 10);\nconst clipDuration = Math.min(Math.max(Number(body.clip_duration || 35), 10), 120);\n\n// NOTE:\n// For real clipping, youtube_url must be an actual URL, not auto://trending.\n// If you still use auto mode, add a discovery node before this node to resolve a real video URL.\nconst youtubeUrl = body.youtube_url;\n\nconst clipsPlan = [];\nfor (let i = 0; i < numClips; i++) {\n  const clipNumber = i + 1;\n  const start = i * clipDuration;\n  const end = start + clipDuration;\n  clipsPlan.push({\n    clip_number: clipNumber,\n    title: `${topicHint} - Clip ${clipNumber}`,\n    start_time: start,\n    end_time: end,\n    duration: clipDuration,\n    reason: 'Auto planned by n8n workflow.'\n  });\n}\n\nreturn [{\n  json: {\n    task_id: Number(body.task_id),\n    workflow_mode: workflowMode,\n    youtube_url: youtubeUrl,\n    num_clips: numClips,\n    watermark_url: body.watermark_url || null,\n    callback_url: body.callback_url || 'https://clipper.dimascndraa.me/api/ai-clipper/callback',\n    render_upload_url: body.render_upload_url || 'https://clipper.dimascndraa.me/api/ai-clipper/render-upload',\n    render_api_key: body.render_api_key || '123456',\n    topic_hint: topicHint,\n    fact_check_notes: `Topik ${topicHint} divalidasi dari beberapa sumber tepercaya.`,\n    source_podcast_query: `podcast ${topicHint} indonesia`,\n    clips_plan: clipsPlan\n  }\n}];"
       },
       "id": "2",
-      "name": "Prepare Topic & Fact Check",
+      "name": "Prepare Topic & Clip Plan",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -32,12 +32,27 @@
     },
     {
       "parameters": {
-        "jsCode": "const input = $json;\nconst clips = [];\nconst total = Math.min(Math.max(input.num_clips || 1, 1), 10);\nconst callbackUrl = String(input.callback_url || '');\nconst callbackOriginMatch = callbackUrl.match(/^(https?:\\/\\/[^/]+)/i);\nconst callbackOrigin = callbackOriginMatch ? callbackOriginMatch[1] : 'https://clipper.dimascndraa.me';\nconst clipBaseUrl = input.clip_base_url || `${callbackOrigin}/storage/autoclipper`;\n\nfor (let i = 1; i <= total; i++) {\n  const start = (i - 1) * 35;\n  const end = start + 35;\n  const providedUrl = input.clips?.[i - 1]?.video_clip_url || null;\n\n  clips.push({\n    clip_number: i,\n    title: `${input.topic} - Clip ${i}`,\n    start_time: start,\n    end_time: end,\n    duration: end - start,\n    reason: 'Bagian paling relevan untuk format Shorts.',\n    video_clip_url: providedUrl || `${clipBaseUrl}/task-${input.task_id || 'demo'}/clip-${i}.mp4`\n  });\n}\n\nreturn [{\n  json: {\n    ...input,\n    clips,\n    total_clips: clips.length,\n    youtube_publish_status: 'review_pending'\n  }\n}];"
+        "method": "POST",
+        "url": "={{$json.render_upload_url}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-render-api-key",
+              "value": "={{$json.render_api_key}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "contentType": "json",
+        "jsonBody": "={{ {\n  task_id: $json.task_id,\n  youtube_url: $json.youtube_url,\n  num_clips: $json.num_clips,\n  topic_hint: $json.topic_hint,\n  watermark_url: $json.watermark_url,\n  callback_url: $json.callback_url,\n  fact_check_notes: $json.fact_check_notes,\n  source_podcast_query: $json.source_podcast_query,\n  clips_plan: $json.clips_plan\n} }}",
+        "options": {}
       },
       "id": "3",
-      "name": "Generate Clips Payload",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
+      "name": "Render and Upload Clips",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
       "position": [
         790,
         300
@@ -45,17 +60,15 @@
     },
     {
       "parameters": {
-        "respondWith": "json",
-        "responseBody": "={\n  \"status\": \"accepted\",\n  \"message\": \"Workflow started\",\n  \"task_id\": {{$json.task_id}}\n}",
-        "options": {}
+        "jsCode": "const render = $json;\n\nif (render.status !== 'completed') {\n  return [{\n    json: {\n      task_id: Number(render.task_id || 0),\n      callback_url: render.callback_url || 'https://clipper.dimascndraa.me/api/ai-clipper/callback',\n      status: 'failed',\n      error: render.error || 'Render/upload failed in render-upload endpoint.',\n      youtube_publish_status: 'failed'\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    task_id: Number(render.task_id),\n    callback_url: render.callback_url,\n    status: 'completed',\n    total_clips: Number(render.total_clips || 0),\n    clips: render.rendered_clips || [],\n    fact_check_notes: render.fact_check_notes || null,\n    source_podcast_query: render.source_podcast_query || null,\n    youtube_publish_status: 'review_pending'\n  }\n}];"
       },
       "id": "4",
-      "name": "Respond Accepted",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
+      "name": "Prepare Callback Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        790,
-        120
+        1060,
+        300
       ]
     },
     {
@@ -65,7 +78,7 @@
         "sendBody": true,
         "specifyBody": "json",
         "contentType": "json",
-        "jsonBody": "={{ {\n  task_id: $json.task_id,\n  status: 'completed',\n  total_clips: $json.total_clips,\n  fact_check_notes: $json.fact_check_notes,\n  source_podcast_query: $json.source_podcast_query,\n  youtube_publish_status: $json.youtube_publish_status || 'review_pending',\n  clips: $json.clips\n} }}",
+        "jsonBody": "={{ {\n  task_id: $json.task_id,\n  status: $json.status,\n  total_clips: $json.total_clips,\n  clips: $json.clips,\n  fact_check_notes: $json.fact_check_notes,\n  source_podcast_query: $json.source_podcast_query,\n  youtube_publish_status: $json.youtube_publish_status,\n  error: $json.error\n} }}",
         "options": {}
       },
       "id": "5",
@@ -73,8 +86,23 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1060,
+        1320,
         300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"accepted\",\n  \"message\": \"Workflow processed and callback sent\",\n  \"task_id\": {{$node[\"Prepare Callback Payload\"].json[\"task_id\"]}}\n}",
+        "options": {}
+      },
+      "id": "6",
+      "name": "Respond Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        120
       ]
     }
   ],
@@ -83,25 +111,36 @@
       "main": [
         [
           {
-            "node": "Prepare Topic & Fact Check",
+            "node": "Prepare Topic & Clip Plan",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Prepare Topic & Fact Check": {
+    "Prepare Topic & Clip Plan": {
       "main": [
         [
           {
-            "node": "Generate Clips Payload",
+            "node": "Render and Upload Clips",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Generate Clips Payload": {
+    "Render and Upload Clips": {
+      "main": [
+        [
+          {
+            "node": "Prepare Callback Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Callback Payload": {
       "main": [
         [
           {
@@ -126,7 +165,7 @@
     "templateCredsSetupCompleted": false
   },
   "active": false,
-  "versionId": "autoclipper-template-v2",
+  "versionId": "autoclipper-template-v3",
   "id": "autoclipper-template",
   "tags": []
 }

@@ -9,6 +9,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use Symfony\Component\Process\Process;
 
 class AiClipperController extends Controller
 {
@@ -161,6 +163,8 @@ class AiClipperController extends Controller
                 'watermark_url' => $watermarkUrl,
                 'task_id' => $task->id,
                 'callback_url' => $callbackUrl,
+                'render_upload_url' => route('api.ai-clipper.render-upload'),
+                'render_api_key' => config('services.n8n.render_api_key'),
                 'workflow_steps' => [
                     'discover_trending_topic',
                     'fact_check_topic',
@@ -332,6 +336,258 @@ class AiClipperController extends Controller
     }
 
     /**
+     * Render clips from source video and upload to local server storage.
+     */
+    public function renderAndUpload(Request $request)
+    {
+        $expectedApiKey = config('services.n8n.render_api_key');
+        if (!empty($expectedApiKey)) {
+            $providedApiKey = $request->header('x-render-api-key') ?: $request->header('x-api-key');
+            if ($providedApiKey !== $expectedApiKey) {
+                return response()->json(['error' => 'Unauthorized render request'], 401);
+            }
+        }
+
+        $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
+            'task_id' => 'required|integer|exists:video_tasks,id',
+            'youtube_url' => 'required|url',
+            'num_clips' => 'nullable|integer|min:1|max:10',
+            'topic_hint' => 'nullable|string|max:255',
+            'watermark_url' => 'nullable|url',
+            'callback_url' => 'nullable|url',
+            'fact_check_notes' => 'nullable|string',
+            'source_podcast_query' => 'nullable|string',
+            'clips_plan' => 'nullable|array',
+            'clips_plan.*.clip_number' => 'nullable|integer|min:1',
+            'clips_plan.*.title' => 'nullable|string|max:255',
+            'clips_plan.*.start_time' => 'nullable|numeric|min:0',
+            'clips_plan.*.end_time' => 'nullable|numeric|min:0',
+            'clips_plan.*.duration' => 'nullable|numeric|min:1',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['error' => 'Validation failed', 'details' => $validator->errors()], 422);
+        }
+
+        $youtubeUrl = $request->input('youtube_url');
+        $isAutoDiscovery = str_starts_with($youtubeUrl, 'auto://');
+
+        $taskId = (int) $request->input('task_id');
+        $numClips = (int) $request->input('num_clips', 1);
+        $topicHint = $request->input('topic_hint', 'AutoClip');
+        $defaultClipDuration = (int) config('services.n8n.default_clip_duration', 35);
+        $defaultClipDuration = max(10, min($defaultClipDuration, 120));
+        $clipsPlan = $request->input('clips_plan', []);
+
+        $ffmpegBin = config('services.n8n.ffmpeg_bin', 'ffmpeg');
+        $ffprobeBin = config('services.n8n.ffprobe_bin', 'ffprobe');
+        $ytDlpBin = config('services.n8n.ytdlp_bin', 'yt-dlp');
+
+        $tmpRoot = storage_path('app/tmp/autoclipper');
+        $tmpDir = $tmpRoot . DIRECTORY_SEPARATOR . Str::uuid()->toString();
+        $taskDirRelative = 'autoclipper/task-' . $taskId;
+        $taskDirAbsolute = storage_path('app/public/' . $taskDirRelative);
+
+        File::ensureDirectoryExists($tmpRoot);
+        File::ensureDirectoryExists($tmpDir);
+        File::ensureDirectoryExists($taskDirAbsolute);
+
+        try {
+            $sourceTemplate = $tmpDir . DIRECTORY_SEPARATOR . 'source.%(ext)s';
+            $sourceInput = $youtubeUrl;
+            if ($isAutoDiscovery) {
+                $searchTopic = trim((string) $request->input('topic_hint', 'trending indonesia hari ini'));
+                $searchQuery = $searchTopic !== '' ? $searchTopic : 'trending indonesia hari ini';
+                $sourceInput = 'ytsearch1:' . $searchQuery;
+            }
+
+            $download = new Process([
+                $ytDlpBin,
+                '--no-playlist',
+                '-f',
+                'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+                '-o',
+                $sourceTemplate,
+                $sourceInput,
+            ]);
+            $download->setTimeout(1800);
+            $download->run();
+
+            if (!$download->isSuccessful()) {
+                return response()->json([
+                    'error' => 'Failed to download source video.',
+                    'details' => trim($download->getErrorOutput() ?: $download->getOutput()),
+                ], 500);
+            }
+
+            $sourceFiles = glob($tmpDir . DIRECTORY_SEPARATOR . 'source.*');
+            if (empty($sourceFiles)) {
+                return response()->json(['error' => 'Source file not found after download.'], 500);
+            }
+            $sourceVideo = $sourceFiles[0];
+
+            $probe = new Process([
+                $ffprobeBin,
+                '-v',
+                'error',
+                '-show_entries',
+                'format=duration',
+                '-of',
+                'default=noprint_wrappers=1:nokey=1',
+                $sourceVideo,
+            ]);
+            $probe->setTimeout(60);
+            $probe->run();
+            if (!$probe->isSuccessful()) {
+                return response()->json([
+                    'error' => 'Failed to inspect source video duration.',
+                    'details' => trim($probe->getErrorOutput() ?: $probe->getOutput()),
+                ], 500);
+            }
+
+            $videoDuration = (float) trim($probe->getOutput());
+            if ($videoDuration <= 0) {
+                return response()->json(['error' => 'Invalid source video duration.'], 500);
+            }
+
+            $watermarkPath = null;
+            if ($request->filled('watermark_url')) {
+                $wmParsed = parse_url($request->input('watermark_url'));
+                $wmPath = $wmParsed['path'] ?? null;
+                if ($wmPath && str_starts_with($wmPath, '/storage/')) {
+                    $relative = ltrim(substr($wmPath, strlen('/storage/')), '/');
+                    $candidate = storage_path('app/public/' . $relative);
+                    if (File::exists($candidate)) {
+                        $watermarkPath = $candidate;
+                    }
+                }
+            }
+
+            $segments = [];
+            $providedPlans = is_array($clipsPlan) ? $clipsPlan : [];
+            for ($i = 0; $i < $numClips; $i++) {
+                $plan = $providedPlans[$i] ?? [];
+                $clipNumber = (int) ($plan['clip_number'] ?? ($i + 1));
+                $start = isset($plan['start_time']) ? (float) $plan['start_time'] : ($i * $defaultClipDuration);
+                $end = isset($plan['end_time']) ? (float) $plan['end_time'] : min($start + $defaultClipDuration, $videoDuration);
+
+                if ($start >= $videoDuration) {
+                    break;
+                }
+
+                $end = min($end, $videoDuration);
+                if ($end <= $start) {
+                    continue;
+                }
+
+                $segments[] = [
+                    'clip_number' => $clipNumber,
+                    'title' => $plan['title'] ?? ($topicHint . ' - Clip ' . $clipNumber),
+                    'start_time' => $start,
+                    'end_time' => $end,
+                    'duration' => $end - $start,
+                    'reason' => $plan['reason'] ?? 'Auto generated segment by render engine.',
+                ];
+            }
+
+            if (empty($segments)) {
+                return response()->json(['error' => 'No valid clip segments to render.'], 422);
+            }
+
+            $renderedClips = [];
+            $renderErrors = [];
+            foreach ($segments as $segment) {
+                $clipNumber = $segment['clip_number'];
+                $tmpOutput = $tmpDir . DIRECTORY_SEPARATOR . 'clip-' . $clipNumber . '.mp4';
+
+                $ffmpegCommand = [
+                    $ffmpegBin,
+                    '-y',
+                    '-ss',
+                    (string) round($segment['start_time'], 3),
+                    '-to',
+                    (string) round($segment['end_time'], 3),
+                    '-i',
+                    $sourceVideo,
+                ];
+
+                if ($watermarkPath) {
+                    $ffmpegCommand = array_merge($ffmpegCommand, [
+                        '-i',
+                        $watermarkPath,
+                        '-filter_complex',
+                        '[1:v]scale=iw*0.2:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20',
+                    ]);
+                }
+
+                $ffmpegCommand = array_merge($ffmpegCommand, [
+                    '-c:v',
+                    'libx264',
+                    '-preset',
+                    'veryfast',
+                    '-crf',
+                    '23',
+                    '-c:a',
+                    'aac',
+                    '-movflags',
+                    '+faststart',
+                    $tmpOutput,
+                ]);
+
+                $render = new Process($ffmpegCommand);
+                $render->setTimeout(1800);
+                $render->run();
+
+                if (!$render->isSuccessful() || !File::exists($tmpOutput)) {
+                    $renderErrors[] = [
+                        'clip_number' => $clipNumber,
+                        'error' => trim($render->getErrorOutput() ?: $render->getOutput()),
+                    ];
+                    continue;
+                }
+
+                $finalFile = $taskDirAbsolute . DIRECTORY_SEPARATOR . 'clip-' . $clipNumber . '.mp4';
+                File::copy($tmpOutput, $finalFile);
+
+                $relativePublicPath = $taskDirRelative . '/clip-' . $clipNumber . '.mp4';
+                $segment['video_clip_url'] = asset('storage/' . $relativePublicPath);
+                $renderedClips[] = $segment;
+            }
+
+            if (empty($renderedClips)) {
+                return response()->json([
+                    'error' => 'Failed to render all requested clips.',
+                    'render_errors' => $renderErrors,
+                ], 500);
+            }
+
+            return response()->json([
+                'task_id' => $taskId,
+                'status' => 'completed',
+                'callback_url' => $request->input('callback_url'),
+                'fact_check_notes' => $request->input('fact_check_notes'),
+                'source_podcast_query' => $request->input('source_podcast_query'),
+                'rendered_clips' => $renderedClips,
+                'total_clips' => count($renderedClips),
+                'render_errors' => $renderErrors,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Render upload error', [
+                'task_id' => $taskId,
+                'message' => $e->getMessage(),
+            ]);
+            return response()->json([
+                'error' => 'Internal render error',
+                'details' => $e->getMessage(),
+            ], 500);
+        } finally {
+            if (File::exists($tmpDir)) {
+                File::deleteDirectory($tmpDir);
+            }
+        }
+    }
+
+    /**
      * Download specific clip (Redirect to URL as storage might be external/Cloudinary)
      */
     public function downloadClip($taskId, $clipNumber)
@@ -358,6 +614,12 @@ class AiClipperController extends Controller
                     'Content-Type' => 'video/mp4',
                 ]);
             }
+
+            return response()->json([
+                'error' => 'Clip file not found on server storage.',
+                'expected_path' => $relativePath,
+                'hint' => 'Workflow n8n harus meng-generate file video nyata dan mengupload ke storage.',
+            ], 404);
         }
 
         return redirect()->away($clip->video_clip_url);
