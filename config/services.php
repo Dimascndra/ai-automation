@@ -35,4 +35,12 @@ return [
         ],
     ],
 
+    'n8n' => [
+        'api_key' => env('N8N_API_KEY', '123456'),
+        'video_clipper_webhook_url' => env(
+            'N8N_VIDEO_CLIPPER_WEBHOOK_URL',
+            'https://aidimascndraa.app.n8n.cloud/webhook/video-clipper'
+        ),
+    ],
+
 ];

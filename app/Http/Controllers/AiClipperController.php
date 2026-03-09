@@ -115,6 +115,9 @@ class AiClipperController extends Controller
         $youtubeUrl = $workflowMode === 'manual_url' ? $request->input('url') : 'auto://trending';
         $watermarkPath = null;
         $watermarkUrl = null;
+        $n8nWebhookUrl = config('services.n8n.video_clipper_webhook_url');
+        $n8nApiKey = config('services.n8n.api_key');
+        $callbackUrl = route('api.ai-clipper.callback');
 
         // Handle File Upload
         if ($request->hasFile('watermark')) {
@@ -136,6 +139,18 @@ class AiClipperController extends Controller
             'youtube_publish_status' => 'review_pending',
         ]);
 
+        if (!$n8nWebhookUrl) {
+            $task->update([
+                'status' => 'failed',
+                'ai_summary' => 'N8N webhook URL is not configured.',
+            ]);
+
+            return response()->json([
+                'status' => 'error',
+                'message' => 'N8N webhook URL belum dikonfigurasi.',
+            ], 500);
+        }
+
         // 2. "Tendang" Bola ke n8n
         try {
             $payload = [
@@ -145,6 +160,7 @@ class AiClipperController extends Controller
                 'num_clips' => (int) $numClips,
                 'watermark_url' => $watermarkUrl,
                 'task_id' => $task->id,
+                'callback_url' => $callbackUrl,
                 'workflow_steps' => [
                     'discover_trending_topic',
                     'fact_check_topic',
@@ -155,15 +171,25 @@ class AiClipperController extends Controller
                 ],
             ];
 
-            Log::info('Sending payload to n8n:', $payload);
+            Log::info('Sending payload to n8n:', [
+                'url' => $n8nWebhookUrl,
+                'payload' => $payload,
+            ]);
 
-            // Updated Endpoint
-            $response = Http::timeout(30)->asJson()->withHeaders([
-                'x-api-key' => '123456' // Assuming auth is static or config based
-            ])->post('https://n8n.dimascndraa.me/webhook/video-clipper', $payload);
+            $httpClient = Http::timeout(30)->asJson();
+            if (!empty($n8nApiKey)) {
+                $httpClient = $httpClient->withHeaders([
+                    'x-api-key' => $n8nApiKey,
+                ]);
+            }
+
+            $response = $httpClient->post($n8nWebhookUrl, $payload);
 
             if ($response->failed()) {
-                $task->update(['status' => 'failed']);
+                $task->update([
+                    'status' => 'failed',
+                    'ai_summary' => 'N8N request failed with status ' . $response->status(),
+                ]);
                 Log::error('N8N Error:', ['status' => $response->status(), 'body' => $response->body()]);
 
                 return response()->json([
@@ -179,7 +205,10 @@ class AiClipperController extends Controller
                 'task' => $task
             ]);
         } catch (\Exception $e) {
-            $task->update(['status' => 'failed']);
+            $task->update([
+                'status' => 'failed',
+                'ai_summary' => 'Connection failed: ' . $e->getMessage(),
+            ]);
             Log::error('Controller Error:', ['message' => $e->getMessage()]);
             return response()->json(['status' => 'error', 'message' => 'Koneksi Gagal: ' . $e->getMessage()], 500);
         }
