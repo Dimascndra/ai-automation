@@ -6,6 +6,7 @@ use App\Models\VideoClip;
 use App\Models\VideoTask;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
@@ -71,24 +72,47 @@ class AiClipperController extends Controller
     }
 
     /**
+     * Return the n8n JSON workflow template used by this repo.
+     */
+    public function workflowJson()
+    {
+        $path = resource_path('workflows/n8n/autoclipper-youtube-shorts.workflow.json');
+
+        if (!File::exists($path)) {
+            return response()->json(['error' => 'Workflow JSON not found'], 404);
+        }
+
+        $json = File::get($path);
+
+        return response($json, 200)
+            ->header('Content-Type', 'application/json')
+            ->header('Content-Disposition', 'inline; filename="autoclipper-youtube-shorts.workflow.json"');
+    }
+
+    /**
      * Store a newly created resource in storage.
      */
     public function store(Request $request)
     {
         $request->validate([
+            'workflow_mode' => 'required|in:auto_trending,manual_url',
             'url' => [
-                'required',
+                'nullable',
+                'required_if:workflow_mode,manual_url',
                 'url',
                 'regex:/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/'
             ],
+            'topic_hint' => 'nullable|string|max:255',
             'num_clips' => 'nullable|integer|min:1|max:10',
-            'watermark' => 'nullable|image|max:2048', // Max 2MB
+            'watermark' => 'nullable|image|max:2048',
         ]);
 
         // Rate limiting could be done via middleware 'throttle:5,60' in routes, implemented here manually if needed or via route definition.
         // Assuming route middleware preference for rate limiting.
 
         $numClips = $request->input('num_clips', 1);
+        $workflowMode = $request->input('workflow_mode', 'auto_trending');
+        $youtubeUrl = $workflowMode === 'manual_url' ? $request->input('url') : 'auto://trending';
         $watermarkPath = null;
         $watermarkUrl = null;
 
@@ -103,19 +127,32 @@ class AiClipperController extends Controller
 
         // 1. Simpan Data Awal (Status: Processing)
         $task = VideoTask::create([
-            'youtube_url' => $request->input('url'),
+            'workflow_mode' => $workflowMode,
+            'youtube_url' => $youtubeUrl,
+            'topic_hint' => $request->input('topic_hint'),
             'num_clips' => $numClips,
             'watermark_path' => $watermarkPath,
-            'status' => 'processing'
+            'status' => 'processing',
+            'youtube_publish_status' => 'review_pending',
         ]);
 
         // 2. "Tendang" Bola ke n8n
         try {
             $payload = [
-                'youtube_url' => $request->input('url'),
+                'workflow_mode' => $workflowMode,
+                'youtube_url' => $youtubeUrl,
+                'topic_hint' => $request->input('topic_hint'),
                 'num_clips' => (int) $numClips,
                 'watermark_url' => $watermarkUrl,
                 'task_id' => $task->id,
+                'workflow_steps' => [
+                    'discover_trending_topic',
+                    'fact_check_topic',
+                    'find_relevant_podcast_sources',
+                    'extract_clips_by_target_count',
+                    'render_shorts_video',
+                    'upload_to_youtube_shorts_review_pending',
+                ],
             ];
 
             Log::info('Sending payload to n8n:', $payload);
@@ -166,6 +203,9 @@ class AiClipperController extends Controller
             'clips.*.start_time' => 'required|numeric',
             'clips.*.end_time' => 'required|numeric',
             'clips.*.duration' => 'required|numeric',
+            'fact_check_notes' => 'nullable|string',
+            'source_podcast_query' => 'nullable|string',
+            'youtube_publish_status' => 'nullable|in:review_pending,published,failed',
             'error' => 'nullable|string'
         ]);
 
@@ -185,15 +225,17 @@ class AiClipperController extends Controller
             if ($request->status === 'failed') {
                 $task->update([
                     'status' => 'failed',
-                    // Assuming we might want to store error reason in ai_summary or a new field, using ai_summary for now
-                    'ai_summary' => $request->error ?? 'Unknown error from N8N'
+                    'ai_summary' => $request->error ?? 'Unknown error from N8N',
+                    'youtube_publish_status' => $request->youtube_publish_status ?? 'failed',
                 ]);
             } else {
-                // Update Task Detail
                 $task->update([
                     'status' => 'completed',
                     'total_clips' => $request->total_clips,
                     'ai_summary' => 'Processed ' . $request->total_clips . ' clips.',
+                    'fact_check_notes' => $request->fact_check_notes,
+                    'source_podcast_query' => $request->source_podcast_query,
+                    'youtube_publish_status' => $request->youtube_publish_status ?? 'review_pending',
                 ]);
 
                 // Insert Clips
