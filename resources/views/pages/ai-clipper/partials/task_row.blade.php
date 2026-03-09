@@ -51,11 +51,9 @@
         </div>
     </td>
     <td class="pl-0">
-        <a href="{{ $task->youtube_url }}" target="_blank"
-            class="text-dark-75 font-weight-bolder text-hover-primary mb-1 font-size-lg text-truncate"
-            style="max-width: 250px; display:block;">
-            {{ $task->youtube_url }}
-        </a>
+        <span class="text-dark-75 font-weight-bolder mb-1 font-size-lg text-truncate" style="max-width: 250px; display:block;">
+            {{ $task->topic_hint ?? ($task->youtube_url !== 'auto://trending' ? $task->youtube_url : 'Auto topic discovery') }}
+        </span>
         <span class="text-muted font-weight-bold d-block">{{ $task->created_at->diffForHumans() }}</span>
     </td>
     <td class="text-right">

@@ -24,13 +24,27 @@
             </div>
             <div class="card-body">
                 <div class="form-group row my-2">
-                    <label class="col-4 col-form-label">YouTube URL:</label>
+                    <label class="col-4 col-form-label">Workflow Mode:</label>
                     <div class="col-8">
-                        <span class="form-control-plaintext font-weight-bolder">
-                            <a href="{{ $task->youtube_url }}" target="_blank">{{ $task->youtube_url }}</a>
-                        </span>
+                        <span class="form-control-plaintext font-weight-bolder text-uppercase">{{ $task->workflow_mode }}</span>
                     </div>
                 </div>
+                <div class="form-group row my-2">
+                    <label class="col-4 col-form-label">Topik:</label>
+                    <div class="col-8">
+                        <span class="form-control-plaintext font-weight-bolder">{{ $task->topic_hint ?? 'Auto discovery' }}</span>
+                    </div>
+                </div>
+                @if ($task->youtube_url && $task->youtube_url !== 'auto://trending')
+                    <div class="form-group row my-2">
+                        <label class="col-4 col-form-label">YouTube URL:</label>
+                        <div class="col-8">
+                            <span class="form-control-plaintext font-weight-bolder">
+                                <a href="{{ $task->youtube_url }}" target="_blank">{{ $task->youtube_url }}</a>
+                            </span>
+                        </div>
+                    </div>
+                @endif
                 <div class="form-group row my-2">
                     <label class="col-4 col-form-label">Status:</label>
                     <div class="col-8">
@@ -51,6 +65,14 @@
                         <label class="col-4 col-form-label">Summary / Error:</label>
                         <div class="col-8">
                             <p class="form-control-plaintext text-muted">{{ $task->ai_summary }}</p>
+                        </div>
+                    </div>
+                @endif
+                @if ($task->fact_check_notes)
+                    <div class="form-group row my-2">
+                        <label class="col-4 col-form-label">Fact Check:</label>
+                        <div class="col-8">
+                            <p class="form-control-plaintext text-muted">{{ $task->fact_check_notes }}</p>
                         </div>
                     </div>
                 @endif

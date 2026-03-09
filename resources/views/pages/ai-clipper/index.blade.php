@@ -23,18 +23,24 @@
                 <div class="card card-custom gutter-b">
                     <div class="card-header border-0 pt-5">
                         <h3 class="card-title align-items-start flex-column">
-                            <span class="card-label font-weight-bolder text-dark">New Project</span>
-                            <span class="text-muted mt-3 font-weight-bold font-size-sm">Submit video for processing</span>
+                            <span class="card-label font-weight-bolder text-dark">AutoClipper YouTube Shorts</span>
+                            <span class="text-muted mt-3 font-weight-bold font-size-sm">Tinggal tentukan jumlah klip lalu sistem kerja otomatis</span>
                         </h3>
+                        <div class="card-toolbar">
+                            <button type="button" class="btn btn-sm btn-light-info font-weight-bold" onclick="viewWorkflowJson()">
+                                Lihat Script JSON n8n
+                            </button>
+                        </div>
                     </div>
                     <div class="card-body pt-2">
                         <form id="clipperForm">
                             @csrf
+                            <input type="hidden" name="workflow_mode" value="auto_trending">
                             <div class="form-group pb-2">
-                                <label class="font-weight-bolder text-dark">YouTube URL</label>
-                                <input type="url" name="url" class="form-control form-control-solid form-control-lg"
-                                    placeholder="https://youtube.com/watch?v=..." required />
-                                <span class="form-text text-muted">Paste the full YouTube video URL.</span>
+                                <label class="font-weight-bolder text-dark">Arah Topik (Opsional)</label>
+                                <input type="text" name="topic_hint" class="form-control form-control-solid form-control-lg"
+                                    placeholder="Contoh: AI, ekonomi, sepak bola" />
+                                <span class="form-text text-muted">Kosongkan jika ingin topik hangat dipilih full otomatis.</span>
                             </div>
 
                             <div class="form-group pb-2">
@@ -47,7 +53,7 @@
                                         <span class="input-group-text">Clips</span>
                                     </div>
                                 </div>
-                                <span class="form-text text-muted">Target number of clips (1-10).</span>
+                                <span class="form-text text-muted">Target jumlah klip yang ingin dibuat (1-10).</span>
                             </div>
 
                             <div class="form-group pb-2">
@@ -57,7 +63,19 @@
                                         accept="image/*">
                                     <label class="custom-file-label" for="watermarkFile">Choose file</label>
                                 </div>
-                                <span class="form-text text-muted">Transparent PNG recommended (Max 2MB).</span>
+                                <span class="form-text text-muted">PNG transparan disarankan (Maks 2MB).</span>
+                            </div>
+
+                            <div class="alert alert-light-info mb-4" role="alert">
+                                <div class="mb-1 font-weight-bolder">Workflow otomatis:</div>
+                                <ol class="mb-0 pl-4">
+                                    <li>Cari topik hangat hari ini</li>
+                                    <li>Validasi kebenaran informasi</li>
+                                    <li>Cari podcast relevan</li>
+                                    <li>Ambil klip sesuai target</li>
+                                    <li>Render menjadi Shorts</li>
+                                    <li>Upload ke YouTube Shorts (status: perlu review)</li>
+                                </ol>
                             </div>
 
                             <div id="statusMessage" class="mb-4"></div>
@@ -65,7 +83,7 @@
                             <button type="submit" class="btn btn-primary btn-lg btn-block font-weight-bold" id="btnSubmit">
                                 <span class="spinner-border spinner-border-sm d-none mr-2" role="status" aria-hidden="true"
                                     id="btnSpinner"></span>
-                                Start Processing
+                                Jalankan AutoClipper
                             </button>
                         </form>
                     </div>
@@ -132,6 +150,25 @@
                 <div class="modal-footer">
                     <button type="button" class="btn btn-light-primary font-weight-bold"
                         data-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="workflowJsonModal" tabindex="-1" role="dialog" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-xl" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title font-weight-bolder">Script JSON Workflow n8n</h5>
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                        <i aria-hidden="true" class="ki ki-close"></i>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <pre id="workflowJsonContent" class="p-4 bg-light rounded" style="max-height: 70vh; overflow: auto;"></pre>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-light-primary font-weight-bold" data-dismiss="modal">Close</button>
                 </div>
             </div>
         </div>
@@ -256,6 +293,23 @@
             });
         }
 
+        function viewWorkflowJson() {
+            $('#workflowJsonModal').modal('show');
+            $('#workflowJsonContent').text('Loading workflow JSON...');
+
+            $.ajax({
+                url: "{{ route('ai-clipper.workflow-json') }}",
+                method: 'GET',
+                success: function(data) {
+                    const pretty = JSON.stringify(data, null, 2);
+                    $('#workflowJsonContent').text(pretty);
+                },
+                error: function() {
+                    $('#workflowJsonContent').text('Failed to load workflow JSON from repository.');
+                }
+            });
+        }
+
         function renderTaskRow(task) {
             let statusLabel = '';
             let actionBtn = '';
@@ -300,9 +354,9 @@
                         </div>
                     </td>
                     <td class="pl-0">
-                        <a href="${task.youtube_url}" target="_blank" class="text-dark-75 font-weight-bolder text-hover-primary mb-1 font-size-lg text-truncate" style="max-width: 250px; display:block;">
-                            ${task.youtube_url}
-                        </a>
+                        <span class="text-dark-75 font-weight-bolder mb-1 font-size-lg text-truncate" style="max-width: 250px; display:block;">
+                            ${task.topic_hint || (task.youtube_url && task.youtube_url !== 'auto://trending' ? task.youtube_url : 'Auto topic discovery')}
+                        </span>
                         <span class="text-muted font-weight-bold d-block">${task.time_ago}</span>
                     </td>
                     <td class="text-right">

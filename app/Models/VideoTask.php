@@ -10,13 +10,18 @@ class VideoTask extends Model
     use HasFactory;
 
     protected $fillable = [
+        'workflow_mode',
         'youtube_url',
+        'topic_hint',
         'num_clips',
         'watermark_path',
         'status',
         'output_filename',
         'ai_summary',
-        'total_clips', // Added
+        'fact_check_notes',
+        'source_podcast_query',
+        'youtube_publish_status',
+        'total_clips',
     ];
 
     public function clips()

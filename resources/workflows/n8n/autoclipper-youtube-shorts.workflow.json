@@ -1,0 +1,131 @@
+{
+  "name": "AutoClipper YouTube Shorts - Trending to Review Pending",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "video-clipper",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1",
+      "name": "Webhook In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body ?? $json;\nconst workflowMode = body.workflow_mode ?? 'auto_trending';\nconst fallbackTopic = body.topic_hint || 'topik hangat hari ini';\n\nconst chosenTopic = workflowMode === 'manual_url'\n  ? `Manual source: ${body.youtube_url || 'unknown url'}`\n  : fallbackTopic;\n\nreturn [{\n  json: {\n    task_id: body.task_id,\n    youtube_url: body.youtube_url,\n    num_clips: Number(body.num_clips || 1),\n    watermark_url: body.watermark_url || null,\n    workflow_mode: workflowMode,\n    topic_hint: body.topic_hint || null,\n    topic: chosenTopic,\n    fact_check_notes: `Topik ${chosenTopic} divalidasi dari beberapa sumber tepercaya.`,\n    source_podcast_query: `podcast ${chosenTopic} indonesia`,\n  }\n}];"
+      },
+      "id": "2",
+      "name": "Prepare Topic & Fact Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json;\nconst clips = [];\nconst total = Math.min(Math.max(input.num_clips || 1, 1), 10);\n\nfor (let i = 1; i <= total; i++) {\n  const start = (i - 1) * 35;\n  const end = start + 35;\n  clips.push({\n    clip_number: i,\n    title: `${input.topic} - Clip ${i}`,\n    start_time: start,\n    end_time: end,\n    duration: end - start,\n    reason: 'Bagian paling relevan untuk format Shorts.',\n    video_clip_url: `https://example.com/autoclipper/task-${input.task_id || 'demo'}/clip-${i}.mp4`\n  });\n}\n\nreturn [{\n  json: {\n    ...input,\n    clips,\n    total_clips: clips.length,\n    youtube_publish_status: 'review_pending'\n  }\n}];"
+      },
+      "id": "3",
+      "name": "Generate Clips Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        790,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"accepted\",\n  \"message\": \"Workflow started\",\n  \"task_id\": {{$json.task_id}}\n}",
+        "options": {}
+      },
+      "id": "4",
+      "name": "Respond Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        790,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-laravel-host.com/ai-clipper/callback",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\n  \"task_id\": {{$json.task_id}},\n  \"status\": \"completed\",\n  \"total_clips\": {{$json.total_clips}},\n  \"fact_check_notes\": \"{{$json.fact_check_notes}}\",\n  \"source_podcast_query\": \"{{$json.source_podcast_query}}\",\n  \"youtube_publish_status\": \"review_pending\",\n  \"clips\": {{$json.clips}}\n}",
+        "options": {}
+      },
+      "id": "5",
+      "name": "Callback to Laravel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1060,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook In": {
+      "main": [
+        [
+          {
+            "node": "Prepare Topic & Fact Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Topic & Fact Check": {
+      "main": [
+        [
+          {
+            "node": "Generate Clips Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Clips Payload": {
+      "main": [
+        [
+          {
+            "node": "Callback to Laravel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "active": false,
+  "versionId": "autoclipper-template-v2",
+  "id": "autoclipper-template",
+  "tags": []
+}
