@@ -391,9 +391,29 @@ class AiClipperController extends Controller
         $defaultClipDuration = max(10, min($defaultClipDuration, 120));
         $clipsPlan = $request->input('clips_plan', []);
 
-        $ffmpegBin = config('services.n8n.ffmpeg_bin', 'ffmpeg');
-        $ffprobeBin = config('services.n8n.ffprobe_bin', 'ffprobe');
-        $ytDlpBin = config('services.n8n.ytdlp_bin', 'yt-dlp');
+        $ffmpegConfigured = (string) config('services.n8n.ffmpeg_bin', 'ffmpeg');
+        $ffprobeConfigured = (string) config('services.n8n.ffprobe_bin', 'ffprobe');
+        $ytDlpConfigured = (string) config('services.n8n.ytdlp_bin', 'yt-dlp');
+
+        $ffmpegBin = $this->resolveBinaryPath($ffmpegConfigured, ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']);
+        $ffprobeBin = $this->resolveBinaryPath($ffprobeConfigured, ['/usr/bin/ffprobe', '/usr/local/bin/ffprobe']);
+        $ytDlpBin = $this->resolveBinaryPath($ytDlpConfigured, ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp']);
+
+        if (!$ffmpegBin || !$ffprobeBin || !$ytDlpBin) {
+            return response()->json([
+                'error' => 'Required binaries not found on server.',
+                'details' => [
+                    'ffmpeg' => $ffmpegBin ?: 'not found',
+                    'ffprobe' => $ffprobeBin ?: 'not found',
+                    'yt_dlp' => $ytDlpBin ?: 'not found',
+                ],
+                'configured' => [
+                    'AUTOCLIPPER_FFMPEG_BIN' => $ffmpegConfigured,
+                    'AUTOCLIPPER_FFPROBE_BIN' => $ffprobeConfigured,
+                    'AUTOCLIPPER_YTDLP_BIN' => $ytDlpConfigured,
+                ],
+            ], 500);
+        }
 
         $tmpRoot = storage_path('app/tmp/autoclipper');
         $tmpDir = $tmpRoot . DIRECTORY_SEPARATOR . Str::uuid()->toString();
@@ -597,6 +617,33 @@ class AiClipperController extends Controller
                 File::deleteDirectory($tmpDir);
             }
         }
+    }
+
+    private function resolveBinaryPath(string $binary, array $fallbacks = []): ?string
+    {
+        $candidates = array_values(array_unique(array_filter(array_merge([$binary], $fallbacks))));
+
+        foreach ($candidates as $candidate) {
+            if (str_contains($candidate, DIRECTORY_SEPARATOR)) {
+                if (is_file($candidate) && is_executable($candidate)) {
+                    return $candidate;
+                }
+                continue;
+            }
+
+            $pathDirectories = explode(PATH_SEPARATOR, (string) getenv('PATH'));
+            $pathDirectories = array_merge($pathDirectories, ['/usr/local/bin', '/usr/bin', '/bin']);
+            $pathDirectories = array_values(array_unique(array_filter($pathDirectories)));
+
+            foreach ($pathDirectories as $directory) {
+                $fullPath = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $candidate;
+                if (is_file($fullPath) && is_executable($fullPath)) {
+                    return $fullPath;
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
