@@ -101,7 +101,7 @@
                                         </div>
                                         <div class="dropdown ml-2" data-toggle="tooltip" title=""
                                             data-placement="left" data-original-title="Actions">
-                                            <a href="{{ $clip->video_clip_url }}" target="_blank"
+                                            <a href="{{ route('ai-clipper.download', ['taskId' => $task->id, 'clipNumber' => $clip->clip_number]) }}" target="_blank"
                                                 class="btn btn-hover-light-primary btn-sm btn-icon">
                                                 <i class="flaticon2-download"></i>
                                             </a>

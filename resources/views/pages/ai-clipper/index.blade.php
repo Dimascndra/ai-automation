@@ -253,7 +253,7 @@
                                     </span>
                                     <span class="list-timeline-time text-right" style="width: 150px">
                                         <span class="badge label label-light-primary label-inline font-weight-bold mr-2">${clip.formatted_duration || formatDuration(clip.duration)}</span>
-                                        <a href="${clip.video_clip_url}" target="_blank" class="btn btn-icon btn-xs btn-light-primary" title="Download">
+                                        <a href="/ai-clipper/${taskId}/download/${clip.clip_number}" target="_blank" class="btn btn-icon btn-xs btn-light-primary" title="Download">
                                             <i class="flaticon2-download"></i>
                                         </a>
                                     </span>

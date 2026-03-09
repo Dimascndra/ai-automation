@@ -344,8 +344,22 @@ class AiClipperController extends Controller
             return response()->json(['error' => 'Clip not found'], 404);
         }
 
-        // Since clips are likely on Cloudinary/External, we redirect or stream.
-        // Redirecting is simplest for external URLs.
+        $clipUrl = $clip->video_clip_url;
+        $parsed = parse_url($clipUrl);
+        $clipPath = $parsed['path'] ?? null;
+
+        // If clip points to local /storage path, stream file via Laravel to bypass web server 403.
+        if ($clipPath && str_starts_with($clipPath, '/storage/')) {
+            $relativePath = ltrim(substr($clipPath, strlen('/storage/')), '/');
+            $localFile = storage_path('app/public/' . $relativePath);
+
+            if (File::exists($localFile)) {
+                return response()->file($localFile, [
+                    'Content-Type' => 'video/mp4',
+                ]);
+            }
+        }
+
         return redirect()->away($clip->video_clip_url);
     }
 }

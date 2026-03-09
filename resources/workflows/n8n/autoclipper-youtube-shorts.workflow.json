@@ -63,6 +63,7 @@
         "method": "POST",
         "url": "={{$json.callback_url}}",
         "sendBody": true,
+        "specifyBody": "json",
         "contentType": "json",
         "jsonBody": "={{ {\n  task_id: $json.task_id,\n  status: 'completed',\n  total_clips: $json.total_clips,\n  fact_check_notes: $json.fact_check_notes,\n  source_podcast_query: $json.source_podcast_query,\n  youtube_publish_status: $json.youtube_publish_status || 'review_pending',\n  clips: $json.clips\n} }}",
         "options": {}
