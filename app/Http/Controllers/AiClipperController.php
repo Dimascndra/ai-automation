@@ -350,7 +350,19 @@ class AiClipperController extends Controller
 
         $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
             'task_id' => 'required|integer|exists:video_tasks,id',
-            'youtube_url' => 'required|url',
+            'youtube_url' => [
+                'required',
+                'string',
+                function ($attribute, $value, $fail) {
+                    if (str_starts_with((string) $value, 'auto://')) {
+                        return;
+                    }
+
+                    if (!filter_var($value, FILTER_VALIDATE_URL)) {
+                        $fail('The youtube url field must be a valid URL or auto:// value.');
+                    }
+                },
+            ],
             'num_clips' => 'nullable|integer|min:1|max:10',
             'topic_hint' => 'nullable|string|max:255',
             'watermark_url' => 'nullable|url',
