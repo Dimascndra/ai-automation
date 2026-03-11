@@ -442,11 +442,11 @@ class AiClipperController extends Controller
         try {
             $sourceTemplate = $tmpDir . DIRECTORY_SEPARATOR . 'source.%(ext)s';
             $sourceInput = $youtubeUrl;
-            $fallbackSourceInput = null;
+            $fallbackSourceInputs = [];
             if ($isAutoDiscovery) {
                 $searchQuery = trim((string) $request->input('source_podcast_query', ''));
+                $searchTopic = trim((string) $request->input('topic_hint', 'teknologi'));
                 if ($searchQuery === '') {
-                    $searchTopic = trim((string) $request->input('topic_hint', 'teknologi'));
                     $searchQuery = 'podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia';
                 }
 
@@ -456,8 +456,11 @@ class AiClipperController extends Controller
 
                 $excludeTerms = '-pertandingan -live -highlight -highlights -gol -goal';
                 $finalQuery = trim($searchQuery . ' ' . $excludeTerms);
-                $sourceInput = 'ytsearch1:' . $finalQuery;
-                $fallbackSourceInput = 'ytsearch1:podcast ' . trim((string) $request->input('topic_hint', 'teknologi')) . ' indonesia';
+                $sourceInput = 'ytsearch5:' . $finalQuery;
+                $fallbackSourceInputs = [
+                    'ytsearch10:podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia',
+                    'ytsearch10:wawancara podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia',
+                ];
 
                 Log::info('Auto podcast source discovery', [
                     'task_id' => $taskId,
@@ -472,67 +475,73 @@ class AiClipperController extends Controller
                 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
                 '--merge-output-format',
                 'mp4',
+                '--js-runtimes',
+                'deno,node',
+                '--extractor-args',
+                'youtube:player_client=android,web',
                 '-o',
                 $sourceTemplate,
             ];
-
-            // In auto mode, keep sources strictly podcast-style and reject match/highlight content.
-            $downloadCommand = $baseDownloadCommand;
             if ($isAutoDiscovery) {
-                $downloadCommand = array_merge($downloadCommand, [
-                    '--match-title',
-                    '(?i)(podcast|obrolan|diskusi|talk\\s?show|wawancara|interview)',
-                    '--reject-title',
-                    '(?i)(pertandingan|live\\s?stream|highlight|highlights|gol\\b|goal\\b|\\bvs\\b|\\bmatch\\b)',
+                $baseDownloadCommand = array_merge($baseDownloadCommand, [
+                    '-i',
+                    '--max-downloads',
+                    '1',
                 ]);
             }
 
-            $downloadCommand = array_merge($downloadCommand, [
-                $sourceInput,
-            ]);
-
-            $download = new Process($downloadCommand);
-            $download->setTimeout(1800);
-            $download->run();
-
-            if (!$download->isSuccessful()) {
-                return response()->json([
-                    'error' => 'Failed to download source video.',
-                    'details' => trim($download->getErrorOutput() ?: $download->getOutput()),
-                ], 500);
-            }
-
-            $downloadOutput = trim($download->getErrorOutput() . "\n" . $download->getOutput());
-            $sourceFiles = array_values(array_filter(
-                glob($tmpDir . DIRECTORY_SEPARATOR . 'source.*') ?: [],
-                fn ($file) => is_file($file) && !str_ends_with($file, '.part')
-            ));
-
-            // If strict filtering yields no file, retry once with a looser podcast-only query.
-            if (empty($sourceFiles) && $isAutoDiscovery && !empty($fallbackSourceInput)) {
-                Log::warning('No source file from strict podcast filters, retrying with fallback query', [
-                    'task_id' => $taskId,
-                    'source_input' => $sourceInput,
-                    'fallback_source_input' => $fallbackSourceInput,
-                ]);
-
-                $fallbackCommand = array_merge($baseDownloadCommand, [$fallbackSourceInput]);
-                $fallbackDownload = new Process($fallbackCommand);
-                $fallbackDownload->setTimeout(1800);
-                $fallbackDownload->run();
-
-                if (!$fallbackDownload->isSuccessful()) {
-                    return response()->json([
-                        'error' => 'Failed to download source video.',
-                        'details' => trim($fallbackDownload->getErrorOutput() ?: $fallbackDownload->getOutput()),
-                    ], 500);
+            $attemptInputs = array_merge([$sourceInput], $fallbackSourceInputs);
+            $downloadOutput = '';
+            $sourceFiles = [];
+            foreach ($attemptInputs as $attemptIndex => $attemptInput) {
+                // Clean old partial files before each attempt.
+                foreach (glob($tmpDir . DIRECTORY_SEPARATOR . 'source.*') ?: [] as $existing) {
+                    if (is_file($existing)) {
+                        @unlink($existing);
+                    }
                 }
 
-                $downloadOutput .= "\n--- fallback ---\n" . trim($fallbackDownload->getErrorOutput() . "\n" . $fallbackDownload->getOutput());
+                $downloadCommand = $baseDownloadCommand;
+                if ($isAutoDiscovery && $attemptIndex === 0) {
+                    // First attempt: strict podcast-only title filtering.
+                    $downloadCommand = array_merge($downloadCommand, [
+                        '--match-title',
+                        '(?i)(podcast|obrolan|diskusi|talk\\s?show|wawancara|interview)',
+                        '--reject-title',
+                        '(?i)(pertandingan|live\\s?stream|highlight|highlights|gol\\b|goal\\b|\\bvs\\b|\\bmatch\\b)',
+                    ]);
+                }
+                $downloadCommand[] = $attemptInput;
+
+                $download = new Process($downloadCommand);
+                $download->setTimeout(1800);
+                $download->run();
+
+                $attemptOutput = trim($download->getErrorOutput() . "\n" . $download->getOutput());
+                $downloadOutput .= ($downloadOutput !== '' ? "\n--- attempt ---\n" : '') . $attemptOutput;
+
                 $sourceFiles = array_values(array_filter(
                     glob($tmpDir . DIRECTORY_SEPARATOR . 'source.*') ?: [],
                     fn ($file) => is_file($file) && !str_ends_with($file, '.part')
                 ));
+
+                if (!empty($sourceFiles)) {
+                    break;
+                }
+
+                if (!$download->isSuccessful() && !$isAutoDiscovery) {
+                    return response()->json([
+                        'error' => 'Failed to download source video.',
+                        'details' => Str::limit($attemptOutput, 1500),
+                    ], 500);
+                }
+            }
+
+            if (empty($sourceFiles) && !empty($downloadOutput)) {
+                return response()->json([
+                    'error' => 'Failed to download source video.',
+                    'details' => Str::limit($downloadOutput, 2500),
+                ], 500);
             }
 
             if (empty($sourceFiles)) {
