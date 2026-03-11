@@ -610,9 +610,11 @@ class AiClipperController extends Controller
 
             $renderedClips = [];
             $renderErrors = [];
-            $targetWidth = 1080;
-            $targetHeight = 1920;
-            $portraitFilter = 'scale=' . $targetWidth . ':' . $targetHeight . ':force_original_aspect_ratio=increase,crop=' . $targetWidth . ':' . $targetHeight . ',setsar=1';
+            $renderProfiles = [
+                ['width' => 1080, 'height' => 1920, 'preset' => 'veryfast', 'crf' => '23', 'threads' => '2'],
+                ['width' => 720, 'height' => 1280, 'preset' => 'ultrafast', 'crf' => '28', 'threads' => '1'],
+                ['width' => 540, 'height' => 960, 'preset' => 'ultrafast', 'crf' => '30', 'threads' => '1'],
+            ];
             $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
             if (!File::exists($subtitleFont)) {
                 $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
@@ -623,71 +625,103 @@ class AiClipperController extends Controller
                 $clipNumber = $segment['clip_number'];
                 $tmpOutput = $tmpDir . DIRECTORY_SEPARATOR . 'clip-' . $clipNumber . '.mp4';
                 $subtitleText = $this->escapeDrawtextText((string) ($segment['subtitle_text'] ?? $segment['title'] ?? 'Podcast Clip'));
-                $subtitleFilter = 'drawtext=' . $fontPart
-                    . 'text=\'' . $subtitleText . '\':'
-                    . 'fontcolor=white:fontsize=52:'
-                    . 'borderw=3:bordercolor=black@0.85:'
-                    . 'box=1:boxcolor=black@0.38:boxborderw=20:'
-                    . 'line_spacing=8:'
-                    . 'x=(w-text_w)/2:y=h-text_h-120';
+                $segmentRendered = false;
+                $attemptErrors = [];
 
-                $ffmpegCommand = [
-                    $ffmpegBin,
-                    '-y',
-                    '-ss',
-                    (string) round($segment['start_time'], 3),
-                    '-to',
-                    (string) round($segment['end_time'], 3),
-                    '-i',
-                    $sourceVideo,
-                ];
+                foreach ($renderProfiles as $profile) {
+                    if (File::exists($tmpOutput)) {
+                        File::delete($tmpOutput);
+                    }
 
-                if ($watermarkPath) {
-                    $ffmpegCommand = array_merge($ffmpegCommand, [
+                    $targetWidth = (int) $profile['width'];
+                    $targetHeight = (int) $profile['height'];
+                    $portraitFilter = 'scale=' . $targetWidth . ':' . $targetHeight . ':force_original_aspect_ratio=increase,crop=' . $targetWidth . ':' . $targetHeight . ',setsar=1';
+                    $subtitleFontSize = max(32, (int) round($targetWidth * 0.048));
+                    $subtitleBorderWidth = max(2, (int) round($subtitleFontSize * 0.06));
+                    $subtitleBoxBorder = max(12, (int) round($subtitleFontSize * 0.35));
+                    $subtitleBottom = max(70, (int) round($targetHeight * 0.06));
+
+                    $subtitleFilter = 'drawtext=' . $fontPart
+                        . 'text=\'' . $subtitleText . '\':'
+                        . 'fontcolor=white:fontsize=' . $subtitleFontSize . ':'
+                        . 'borderw=' . $subtitleBorderWidth . ':bordercolor=black@0.85:'
+                        . 'box=1:boxcolor=black@0.38:boxborderw=' . $subtitleBoxBorder . ':'
+                        . 'line_spacing=8:'
+                        . 'x=(w-text_w)/2:y=h-text_h-' . $subtitleBottom;
+
+                    $ffmpegCommand = [
+                        $ffmpegBin,
+                        '-y',
+                        '-ss',
+                        (string) round($segment['start_time'], 3),
+                        '-to',
+                        (string) round($segment['end_time'], 3),
                         '-i',
-                        $watermarkPath,
-                        '-filter_complex',
-                        '[0:v]' . $portraitFilter . ',' . $subtitleFilter . '[sub];[1:v]scale=iw*0.2:-1[wm];[sub][wm]overlay=W-w-20:H-h-20[vout]',
-                        '-map',
-                        '[vout]',
-                        '-map',
-                        '0:a?',
-                    ]);
-                } else {
+                        $sourceVideo,
+                    ];
+
+                    if ($watermarkPath) {
+                        $ffmpegCommand = array_merge($ffmpegCommand, [
+                            '-i',
+                            $watermarkPath,
+                            '-filter_complex',
+                            '[0:v]' . $portraitFilter . ',' . $subtitleFilter . '[sub];[1:v]scale=iw*0.2:-1[wm];[sub][wm]overlay=W-w-20:H-h-20[vout]',
+                            '-map',
+                            '[vout]',
+                            '-map',
+                            '0:a?',
+                        ]);
+                    } else {
+                        $ffmpegCommand = array_merge($ffmpegCommand, [
+                            '-vf',
+                            $portraitFilter . ',' . $subtitleFilter,
+                            '-map',
+                            '0:v:0',
+                            '-map',
+                            '0:a?',
+                        ]);
+                    }
+
                     $ffmpegCommand = array_merge($ffmpegCommand, [
-                        '-vf',
-                        $portraitFilter . ',' . $subtitleFilter,
-                        '-map',
-                        '0:v:0',
-                        '-map',
-                        '0:a?',
+                        '-c:v',
+                        'libx264',
+                        '-preset',
+                        (string) $profile['preset'],
+                        '-crf',
+                        (string) $profile['crf'],
+                        '-threads',
+                        (string) $profile['threads'],
+                        '-c:a',
+                        'aac',
+                        '-pix_fmt',
+                        'yuv420p',
+                        '-movflags',
+                        '+faststart',
+                        $tmpOutput,
                     ]);
+
+                    $render = new Process($ffmpegCommand);
+                    $render->setTimeout(1800);
+                    $render->run();
+
+                    if ($render->isSuccessful() && File::exists($tmpOutput) && filesize($tmpOutput) > 0) {
+                        $segment['render_resolution'] = $targetWidth . 'x' . $targetHeight;
+                        $segmentRendered = true;
+                        break;
+                    }
+
+                    $attemptErrors[] = [
+                        'resolution' => $targetWidth . 'x' . $targetHeight,
+                        'preset' => (string) $profile['preset'],
+                        'error' => Str::limit(trim($render->getErrorOutput() ?: $render->getOutput()), 1200),
+                    ];
                 }
 
-                $ffmpegCommand = array_merge($ffmpegCommand, [
-                    '-c:v',
-                    'libx264',
-                    '-preset',
-                    'veryfast',
-                    '-crf',
-                    '23',
-                    '-c:a',
-                    'aac',
-                    '-pix_fmt',
-                    'yuv420p',
-                    '-movflags',
-                    '+faststart',
-                    $tmpOutput,
-                ]);
-
-                $render = new Process($ffmpegCommand);
-                $render->setTimeout(1800);
-                $render->run();
-
-                if (!$render->isSuccessful() || !File::exists($tmpOutput)) {
+                if (!$segmentRendered) {
                     $renderErrors[] = [
                         'clip_number' => $clipNumber,
-                        'error' => trim($render->getErrorOutput() ?: $render->getOutput()),
+                        'error' => 'All render profiles failed.',
+                        'attempts' => $attemptErrors,
                     ];
                     continue;
                 }
