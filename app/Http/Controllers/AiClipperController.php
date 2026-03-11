@@ -401,7 +401,7 @@ class AiClipperController extends Controller
 
         $taskId = (int) $request->input('task_id');
         $numClips = (int) $request->input('num_clips', 1);
-        $topicHint = $request->input('topic_hint', 'AutoClip');
+        $topicHint = $this->normalizeTopicHint((string) $request->input('topic_hint', 'AutoClip'));
         $defaultClipDuration = (int) config('services.n8n.default_clip_duration', 35);
         $defaultClipDuration = max(10, min($defaultClipDuration, 120));
         $clipsPlan = $request->input('clips_plan', []);
@@ -1275,7 +1275,7 @@ class AiClipperController extends Controller
         bool $useAi,
         ?string $aiModel = null
     ): array {
-        $topic = trim($topicHint) !== '' ? trim($topicHint) : 'teknologi';
+        $topic = $this->normalizeTopicHint($topicHint);
         $sourceQuery = $this->normalizePodcastQuery($requestedSourceQuery, $topic, $excludeTerms);
 
         $defaultCandidates = [
@@ -2013,6 +2013,30 @@ class AiClipperController extends Controller
         }
 
         return preg_replace('/\s+/', ' ', $q) ?: $q;
+    }
+
+    private function normalizeTopicHint(string $topicHint): string
+    {
+        $topic = trim($topicHint);
+        if ($topic === '') {
+            return 'teknologi';
+        }
+
+        $normalized = mb_strtolower($topic);
+        $generic = [
+            'topik hangat',
+            'trending',
+            'viral',
+            'autoclip',
+            'auto clip',
+            'auto',
+        ];
+
+        if (in_array($normalized, $generic, true)) {
+            return 'teknologi';
+        }
+
+        return $topic;
     }
 
     private function extractJsonFromText(string $content): ?array
