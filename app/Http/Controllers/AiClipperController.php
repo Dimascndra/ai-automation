@@ -97,10 +97,9 @@ class AiClipperController extends Controller
     public function store(Request $request)
     {
         $request->validate([
-            'workflow_mode' => 'required|in:auto_trending,manual_url',
+            'workflow_mode' => 'required|in:manual_url',
             'url' => [
-                'nullable',
-                'required_if:workflow_mode,manual_url',
+                'required',
                 'url',
                 'regex:/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/'
             ],
@@ -113,8 +112,8 @@ class AiClipperController extends Controller
         // Assuming route middleware preference for rate limiting.
 
         $numClips = $request->input('num_clips', 1);
-        $workflowMode = $request->input('workflow_mode', 'auto_trending');
-        $youtubeUrl = $workflowMode === 'manual_url' ? $request->input('url') : 'auto://trending';
+        $workflowMode = 'manual_url';
+        $youtubeUrl = $request->input('url');
         $watermarkPath = null;
         $watermarkUrl = null;
         $n8nWebhookUrl = config('services.n8n.video_clipper_webhook_url');

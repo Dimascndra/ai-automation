@@ -24,7 +24,7 @@
                     <div class="card-header border-0 pt-5">
                         <h3 class="card-title align-items-start flex-column">
                             <span class="card-label font-weight-bolder text-dark">AutoClipper YouTube Shorts</span>
-                            <span class="text-muted mt-3 font-weight-bold font-size-sm">Tinggal tentukan jumlah klip lalu sistem kerja otomatis</span>
+                            <span class="text-muted mt-3 font-weight-bold font-size-sm">Masukkan link video YouTube, lalu AI pilih momen terbaik jadi Shorts.</span>
                         </h3>
                         <div class="card-toolbar">
                             <button type="button" class="btn btn-sm btn-light-info font-weight-bold" onclick="viewWorkflowJson()">
@@ -35,12 +35,20 @@
                     <div class="card-body pt-2">
                         <form id="clipperForm">
                             @csrf
-                            <input type="hidden" name="workflow_mode" value="auto_trending">
+                            <input type="hidden" name="workflow_mode" value="manual_url">
+                            <div class="form-group pb-2">
+                                <label class="font-weight-bolder text-dark">Link Video YouTube <span class="text-danger">*</span></label>
+                                <input type="url" name="url" class="form-control form-control-solid form-control-lg"
+                                    placeholder="https://www.youtube.com/watch?v=..."
+                                    required />
+                                <span class="form-text text-muted">Wajib diisi. Hanya link YouTube yang valid.</span>
+                            </div>
+
                             <div class="form-group pb-2">
                                 <label class="font-weight-bolder text-dark">Arah Topik (Opsional)</label>
                                 <input type="text" name="topic_hint" class="form-control form-control-solid form-control-lg"
                                     placeholder="Contoh: AI, ekonomi, sepak bola" />
-                                <span class="form-text text-muted">Kosongkan jika ingin topik hangat dipilih full otomatis.</span>
+                                <span class="form-text text-muted">Opsional, untuk membantu AI memilih angle clip.</span>
                             </div>
 
                             <div class="form-group pb-2">
@@ -67,12 +75,11 @@
                             </div>
 
                             <div class="alert alert-light-info mb-4" role="alert">
-                                <div class="mb-1 font-weight-bolder">Workflow otomatis:</div>
+                                <div class="mb-1 font-weight-bolder">Workflow clipping dari link:</div>
                                 <ol class="mb-0 pl-4">
-                                    <li>Cari topik hangat hari ini</li>
-                                    <li>Validasi kebenaran informasi</li>
-                                    <li>Cari podcast relevan</li>
-                                    <li>Ambil klip sesuai target</li>
+                                    <li>Ambil audio/transkrip dari video yang kamu masukkan</li>
+                                    <li>AI menilai momen paling potensial viral</li>
+                                    <li>Buat potongan klip sesuai target jumlah</li>
                                     <li>Render menjadi Shorts</li>
                                     <li>Upload ke YouTube Shorts (status: perlu review)</li>
                                 </ol>
@@ -182,7 +189,18 @@
             e.preventDefault();
             let btn = $('#btnSubmit');
             let spinner = $('#btnSpinner');
+            let urlInput = $('input[name="url"]').val().trim();
             let formData = new FormData(this);
+
+            if (!urlInput) {
+                $('#statusMessage').html(
+                    `<div class="alert alert-custom alert-light-danger fade show mb-5" role="alert">
+                        <div class="alert-icon"><i class="flaticon-warning"></i></div>
+                        <div class="alert-text">Link video YouTube wajib diisi.</div>
+                    </div>`
+                );
+                return;
+            }
 
             btn.prop('disabled', true);
             spinner.removeClass('d-none');
