@@ -714,9 +714,9 @@ class AiClipperController extends Controller
             $renderedClips = [];
             $renderErrors = [];
             $renderProfiles = [
-                ['width' => 1080, 'height' => 1920, 'preset' => 'veryfast', 'crf' => '20', 'threads' => '2'],
-                ['width' => 720, 'height' => 1280, 'preset' => 'veryfast', 'crf' => '23', 'threads' => '1'],
-                ['width' => 540, 'height' => 960, 'preset' => 'ultrafast', 'crf' => '26', 'threads' => '1'],
+                ['width' => 1080, 'height' => 1920, 'preset' => 'faster', 'crf' => '18', 'threads' => '2'],
+                ['width' => 900, 'height' => 1600, 'preset' => 'veryfast', 'crf' => '19', 'threads' => '1'],
+                ['width' => 720, 'height' => 1280, 'preset' => 'veryfast', 'crf' => '20', 'threads' => '1'],
             ];
             $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
             if (!File::exists($subtitleFont)) {
@@ -789,7 +789,7 @@ class AiClipperController extends Controller
 
                     $targetWidth = (int) $profile['width'];
                     $targetHeight = (int) $profile['height'];
-                    $portraitFilter = 'scale=' . $targetWidth . ':' . $targetHeight . ':force_original_aspect_ratio=increase,crop=' . $targetWidth . ':' . $targetHeight . ',setsar=1';
+                    $portraitFilter = 'scale=' . $targetWidth . ':' . $targetHeight . ':flags=lanczos:force_original_aspect_ratio=increase,crop=' . $targetWidth . ':' . $targetHeight . ',setsar=1';
                     $subtitleFontSize = max(32, (int) round($targetWidth * 0.048));
                     $subtitleBorderWidth = max(2, (int) round($subtitleFontSize * 0.06));
                     $subtitleBoxBorder = max(12, (int) round($subtitleFontSize * 0.35));
@@ -1041,7 +1041,15 @@ class AiClipperController extends Controller
         float $videoDuration,
         ?string $aiModel = null
     ): array {
-        $fallback = $this->normalizeClipPlan([], $topicHint, $numClips, $clipDuration);
+        $fallback = $this->normalizeClipPlan(
+            plan: [],
+            topic: $topicHint,
+            numClips: $numClips,
+            clipDuration: $clipDuration,
+            useFixedDuration: false,
+            minDuration: 18,
+            maxDuration: 95
+        );
         $openAiKey = (string) config('services.openai.api_key', '');
         if ($openAiKey === '') {
             return $fallback;
@@ -1071,7 +1079,7 @@ class AiClipperController extends Controller
         $systemPrompt = 'You are an expert short-video editor for viral podcast clips. Return ONLY valid JSON.';
         $userPrompt = "From transcript segments below, choose {$numClips} best viral-worthy moments. "
             . "Prioritize: controversial opinions, strong hooks, surprising statements, practical insights, emotional lines. "
-            . "Constraints: clip duration around {$clipDuration} seconds, avoid intro/outro fluff. "
+            . "Constraints: choose natural conversation windows; duration should be dynamic based on content flow (around 18-95 seconds), avoid intro/outro fluff. "
             . "Return JSON object with key clips_plan (array), each item keys: clip_number,title,subtitle_text,start_time,end_time,duration,reason.\n\n"
             . json_encode([
                 'topic' => $topicHint,
@@ -1110,7 +1118,15 @@ class AiClipperController extends Controller
 
             $aiClipsRaw = data_get($aiJson, 'clips_plan', []);
             $aiClipsRaw = is_array($aiClipsRaw) ? $aiClipsRaw : [];
-            $normalized = $this->normalizeClipPlan($aiClipsRaw, $topicHint, $numClips, $clipDuration);
+            $normalized = $this->normalizeClipPlan(
+                plan: $aiClipsRaw,
+                topic: $topicHint,
+                numClips: $numClips,
+                clipDuration: $clipDuration,
+                useFixedDuration: false,
+                minDuration: 18,
+                maxDuration: 95
+            );
 
             // Keep clips inside source duration bounds.
             foreach ($normalized as &$clip) {
@@ -1373,7 +1389,15 @@ class AiClipperController extends Controller
         }
     }
 
-    private function normalizeClipPlan(array $plan, string $topic, int $numClips, int $clipDuration): array
+    private function normalizeClipPlan(
+        array $plan,
+        string $topic,
+        int $numClips,
+        int $clipDuration,
+        bool $useFixedDuration = true,
+        int $minDuration = 20,
+        int $maxDuration = 60
+    ): array
     {
         $hooks = [
             'MOMEN PALING PANAS',
@@ -1384,7 +1408,7 @@ class AiClipperController extends Controller
             'PREDIKSI PALING MENARIK',
         ];
         $offsets = [45, 120, 210, 300, 390, 480, 570, 660, 750, 840];
-        $safeDuration = max(20, min($clipDuration, 60));
+        $safeDuration = max($minDuration, min($clipDuration, $maxDuration));
         $normalized = [];
 
         for ($i = 0; $i < $numClips; $i++) {
@@ -1395,11 +1419,34 @@ class AiClipperController extends Controller
             $start = isset($item['start_time']) && is_numeric($item['start_time'])
                 ? (float) $item['start_time']
                 : (float) ($offsets[$i] ?? (45 + ($i * $safeDuration)));
-            $end = isset($item['end_time']) && is_numeric($item['end_time'])
-                ? (float) $item['end_time']
-                : ($start + $safeDuration);
+
+            if ($useFixedDuration) {
+                $end = isset($item['end_time']) && is_numeric($item['end_time'])
+                    ? (float) $item['end_time']
+                    : ($start + $safeDuration);
+            } else {
+                if (isset($item['end_time']) && is_numeric($item['end_time'])) {
+                    $end = (float) $item['end_time'];
+                } elseif (isset($item['duration']) && is_numeric($item['duration'])) {
+                    $rawDuration = (float) $item['duration'];
+                    $dynamicDuration = max($minDuration, min($rawDuration, $maxDuration));
+                    $end = $start + $dynamicDuration;
+                } else {
+                    $end = $start + $safeDuration;
+                }
+            }
+
             if ($end <= $start) {
                 $end = $start + $safeDuration;
+            }
+
+            $currentDuration = $end - $start;
+            if (!$useFixedDuration) {
+                if ($currentDuration < $minDuration) {
+                    $end = $start + $minDuration;
+                } elseif ($currentDuration > $maxDuration) {
+                    $end = $start + $maxDuration;
+                }
             }
 
             $normalized[] = [
