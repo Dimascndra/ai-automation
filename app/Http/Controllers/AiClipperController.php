@@ -433,6 +433,7 @@ class AiClipperController extends Controller
         try {
             $sourceTemplate = $tmpDir . DIRECTORY_SEPARATOR . 'source.%(ext)s';
             $sourceInput = $youtubeUrl;
+            $fallbackSourceInput = null;
             if ($isAutoDiscovery) {
                 $searchQuery = trim((string) $request->input('source_podcast_query', ''));
                 if ($searchQuery === '') {
@@ -447,6 +448,7 @@ class AiClipperController extends Controller
                 $excludeTerms = '-pertandingan -live -highlight -highlights -gol -goal';
                 $finalQuery = trim($searchQuery . ' ' . $excludeTerms);
                 $sourceInput = 'ytsearch1:' . $finalQuery;
+                $fallbackSourceInput = 'ytsearch1:podcast ' . trim((string) $request->input('topic_hint', 'teknologi')) . ' indonesia';
 
                 Log::info('Auto podcast source discovery', [
                     'task_id' => $taskId,
@@ -454,14 +456,19 @@ class AiClipperController extends Controller
                 ]);
             }
 
-            $downloadCommand = [
+            $baseDownloadCommand = [
                 $ytDlpBin,
                 '--no-playlist',
                 '-f',
                 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+                '--merge-output-format',
+                'mp4',
+                '-o',
+                $sourceTemplate,
             ];
 
             // In auto mode, keep sources strictly podcast-style and reject match/highlight content.
+            $downloadCommand = $baseDownloadCommand;
             if ($isAutoDiscovery) {
                 $downloadCommand = array_merge($downloadCommand, [
                     '--match-title',
@@ -472,8 +479,6 @@ class AiClipperController extends Controller
             }
 
             $downloadCommand = array_merge($downloadCommand, [
-                '-o',
-                $sourceTemplate,
                 $sourceInput,
             ]);
 
@@ -488,11 +493,51 @@ class AiClipperController extends Controller
                 ], 500);
             }
 
-            $sourceFiles = glob($tmpDir . DIRECTORY_SEPARATOR . 'source.*');
-            if (empty($sourceFiles)) {
-                return response()->json(['error' => 'Source file not found after download.'], 500);
+            $downloadOutput = trim($download->getErrorOutput() . "\n" . $download->getOutput());
+            $sourceFiles = array_values(array_filter(
+                glob($tmpDir . DIRECTORY_SEPARATOR . 'source.*') ?: [],
+                fn ($file) => is_file($file) && !str_ends_with($file, '.part')
+            ));
+
+            // If strict filtering yields no file, retry once with a looser podcast-only query.
+            if (empty($sourceFiles) && $isAutoDiscovery && !empty($fallbackSourceInput)) {
+                Log::warning('No source file from strict podcast filters, retrying with fallback query', [
+                    'task_id' => $taskId,
+                    'source_input' => $sourceInput,
+                    'fallback_source_input' => $fallbackSourceInput,
+                ]);
+
+                $fallbackCommand = array_merge($baseDownloadCommand, [$fallbackSourceInput]);
+                $fallbackDownload = new Process($fallbackCommand);
+                $fallbackDownload->setTimeout(1800);
+                $fallbackDownload->run();
+
+                if (!$fallbackDownload->isSuccessful()) {
+                    return response()->json([
+                        'error' => 'Failed to download source video.',
+                        'details' => trim($fallbackDownload->getErrorOutput() ?: $fallbackDownload->getOutput()),
+                    ], 500);
+                }
+
+                $downloadOutput .= "\n--- fallback ---\n" . trim($fallbackDownload->getErrorOutput() . "\n" . $fallbackDownload->getOutput());
+                $sourceFiles = array_values(array_filter(
+                    glob($tmpDir . DIRECTORY_SEPARATOR . 'source.*') ?: [],
+                    fn ($file) => is_file($file) && !str_ends_with($file, '.part')
+                ));
             }
-            $sourceVideo = $sourceFiles[0];
+
+            if (empty($sourceFiles)) {
+                return response()->json([
+                    'error' => 'Source file not found after download.',
+                    'details' => Str::limit($downloadOutput, 1500),
+                ], 500);
+            }
+
+            $videoCandidates = array_values(array_filter(
+                $sourceFiles,
+                fn ($file) => preg_match('/\.(mp4|mkv|webm|mov)$/i', $file) === 1
+            ));
+            $sourceVideo = $videoCandidates[0] ?? $sourceFiles[0];
 
             $probe = new Process([
                 $ffprobeBin,
