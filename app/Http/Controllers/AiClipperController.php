@@ -355,6 +355,7 @@ class AiClipperController extends Controller
 
         $validator = \Illuminate\Support\Facades\Validator::make($request->all(), [
             'task_id' => 'required|integer|exists:video_tasks,id',
+            'workflow_mode' => 'nullable|in:auto_trending,manual_url',
             'youtube_url' => [
                 'required',
                 'string',
@@ -378,6 +379,7 @@ class AiClipperController extends Controller
             'source_candidate_queries.*' => 'nullable|string|max:255',
             'ai_enhance' => 'nullable|boolean',
             'ai_model' => 'nullable|string|max:120',
+            'auto_clip_find' => 'nullable|boolean',
             'face_tracking' => 'nullable|boolean',
             'face_tracking_required' => 'nullable|boolean',
             'face_tracking_smoothness' => 'nullable|numeric|min:0.5|max:0.98',
@@ -396,6 +398,7 @@ class AiClipperController extends Controller
 
         $youtubeUrl = $request->input('youtube_url');
         $isAutoDiscovery = str_starts_with($youtubeUrl, 'auto://');
+        $workflowMode = (string) $request->input('workflow_mode', ($isAutoDiscovery ? 'auto_trending' : 'manual_url'));
 
         $taskId = (int) $request->input('task_id');
         $numClips = (int) $request->input('num_clips', 1);
@@ -449,6 +452,7 @@ class AiClipperController extends Controller
 
         $aiEnhance = $request->boolean('ai_enhance', true);
         $aiModel = trim((string) $request->input('ai_model', ''));
+        $autoClipFind = $request->boolean('auto_clip_find', $workflowMode === 'manual_url');
         $excludeTerms = '-pertandingan -live -highlight -highlights -gol -goal';
         $sourcePodcastQuery = trim((string) $request->input('source_podcast_query', ''));
         $sourceCandidateQueries = $request->input('source_candidate_queries', []);
@@ -647,6 +651,22 @@ class AiClipperController extends Controller
                 return response()->json(['error' => 'Invalid source video duration.'], 500);
             }
 
+            if (
+                $workflowMode === 'manual_url'
+                && $autoClipFind
+                && (!$request->has('clips_plan') || empty($clipsPlan))
+            ) {
+                $clipsPlan = $this->buildAiClipPlanFromVideo(
+                    sourceVideo: $sourceVideo,
+                    ffmpegBin: $ffmpegBin,
+                    topicHint: (string) $topicHint,
+                    numClips: $numClips,
+                    clipDuration: $defaultClipDuration,
+                    videoDuration: $videoDuration,
+                    aiModel: $aiModel !== '' ? $aiModel : null,
+                );
+            }
+
             $watermarkPath = null;
             if ($request->filled('watermark_url')) {
                 $wmParsed = parse_url($request->input('watermark_url'));
@@ -695,9 +715,9 @@ class AiClipperController extends Controller
             $renderedClips = [];
             $renderErrors = [];
             $renderProfiles = [
-                ['width' => 1080, 'height' => 1920, 'preset' => 'veryfast', 'crf' => '23', 'threads' => '2'],
-                ['width' => 720, 'height' => 1280, 'preset' => 'ultrafast', 'crf' => '28', 'threads' => '1'],
-                ['width' => 540, 'height' => 960, 'preset' => 'ultrafast', 'crf' => '30', 'threads' => '1'],
+                ['width' => 1080, 'height' => 1920, 'preset' => 'veryfast', 'crf' => '20', 'threads' => '2'],
+                ['width' => 720, 'height' => 1280, 'preset' => 'veryfast', 'crf' => '23', 'threads' => '1'],
+                ['width' => 540, 'height' => 960, 'preset' => 'ultrafast', 'crf' => '26', 'threads' => '1'],
             ];
             $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
             if (!File::exists($subtitleFont)) {
@@ -721,40 +741,46 @@ class AiClipperController extends Controller
                 $segmentRendered = false;
                 $attemptErrors = [];
                 $trackingAppliedForSegment = false;
+                $segmentSourceAvailable = false;
+                if ($canUseFaceTracking) {
+                    $cutSegment = new Process([
+                        $ffmpegBin,
+                        '-y',
+                        '-ss',
+                        (string) round($segment['start_time'], 3),
+                        '-to',
+                        (string) round($segment['end_time'], 3),
+                        '-i',
+                        $sourceVideo,
+                        '-c:v',
+                        'libx264',
+                        '-preset',
+                        'veryfast',
+                        '-crf',
+                        '18',
+                        '-threads',
+                        '1',
+                        '-c:a',
+                        'aac',
+                        '-movflags',
+                        '+faststart',
+                        $segmentSource,
+                    ]);
+                    $cutSegment->setTimeout(600);
+                    $cutSegment->run();
 
-                $cutSegment = new Process([
-                    $ffmpegBin,
-                    '-y',
-                    '-ss',
-                    (string) round($segment['start_time'], 3),
-                    '-to',
-                    (string) round($segment['end_time'], 3),
-                    '-i',
-                    $sourceVideo,
-                    '-c:v',
-                    'libx264',
-                    '-preset',
-                    'ultrafast',
-                    '-crf',
-                    '30',
-                    '-threads',
-                    '1',
-                    '-c:a',
-                    'aac',
-                    '-movflags',
-                    '+faststart',
-                    $segmentSource,
-                ]);
-                $cutSegment->setTimeout(600);
-                $cutSegment->run();
-
-                if (!$cutSegment->isSuccessful() || !File::exists($segmentSource) || filesize($segmentSource) <= 0) {
-                    $renderErrors[] = [
-                        'clip_number' => $clipNumber,
-                        'error' => 'Failed to extract segment before render.',
-                        'details' => Str::limit(trim($cutSegment->getErrorOutput() ?: $cutSegment->getOutput()), 1200),
-                    ];
-                    continue;
+                    if (!$cutSegment->isSuccessful() || !File::exists($segmentSource) || filesize($segmentSource) <= 0) {
+                        $renderErrors[] = [
+                            'clip_number' => $clipNumber,
+                            'error' => 'Failed to extract segment for face tracking.',
+                            'details' => Str::limit(trim($cutSegment->getErrorOutput() ?: $cutSegment->getOutput()), 1200),
+                        ];
+                        if ($faceTrackingRequired) {
+                            continue;
+                        }
+                    } else {
+                        $segmentSourceAvailable = true;
+                    }
                 }
 
                 foreach ($renderProfiles as $profile) {
@@ -782,7 +808,7 @@ class AiClipperController extends Controller
                     $useTrackedVideo = false;
                     $trackingError = null;
 
-                    if ($canUseFaceTracking) {
+                    if ($canUseFaceTracking && $segmentSourceAvailable) {
                         if (File::exists($trackedVideo)) {
                             File::delete($trackedVideo);
                         }
@@ -868,10 +894,21 @@ class AiClipperController extends Controller
                             ]);
                         }
                     } else {
-                        $ffmpegCommand = array_merge($ffmpegCommand, [
-                            '-i',
-                            $segmentSource,
-                        ]);
+                        if ($segmentSourceAvailable) {
+                            $ffmpegCommand = array_merge($ffmpegCommand, [
+                                '-i',
+                                $segmentSource,
+                            ]);
+                        } else {
+                            $ffmpegCommand = array_merge($ffmpegCommand, [
+                                '-ss',
+                                (string) round($segment['start_time'], 3),
+                                '-to',
+                                (string) round($segment['end_time'], 3),
+                                '-i',
+                                $sourceVideo,
+                            ]);
+                        }
 
                         if ($watermarkPath) {
                             $ffmpegCommand = array_merge($ffmpegCommand, [
@@ -994,6 +1031,202 @@ class AiClipperController extends Controller
                 File::deleteDirectory($tmpDir);
             }
         }
+    }
+
+    private function buildAiClipPlanFromVideo(
+        string $sourceVideo,
+        string $ffmpegBin,
+        string $topicHint,
+        int $numClips,
+        int $clipDuration,
+        float $videoDuration,
+        ?string $aiModel = null
+    ): array {
+        $fallback = $this->normalizeClipPlan([], $topicHint, $numClips, $clipDuration);
+        $openAiKey = (string) config('services.openai.api_key', '');
+        if ($openAiKey === '') {
+            return $fallback;
+        }
+
+        $transcription = $this->transcribeVideoForClipDiscovery($sourceVideo, $ffmpegBin);
+        if (!$transcription) {
+            return $fallback;
+        }
+
+        $segments = $transcription['segments'] ?? [];
+        $segments = is_array($segments) ? $segments : [];
+        if (empty($segments) && !empty($transcription['text'])) {
+            $segments = $this->buildPseudoSegmentsFromText(
+                text: (string) $transcription['text'],
+                totalDuration: $videoDuration
+            );
+        }
+        if (empty($segments)) {
+            return $fallback;
+        }
+
+        $segments = array_slice($segments, 0, 350);
+        $model = $aiModel ?: (string) config('services.openai.model', 'gpt-4o-mini');
+        $baseUrl = rtrim((string) config('services.openai.base_url', 'https://api.openai.com/v1'), '/');
+
+        $systemPrompt = 'You are an expert short-video editor for viral podcast clips. Return ONLY valid JSON.';
+        $userPrompt = "From transcript segments below, choose {$numClips} best viral-worthy moments. "
+            . "Prioritize: controversial opinions, strong hooks, surprising statements, practical insights, emotional lines. "
+            . "Constraints: clip duration around {$clipDuration} seconds, avoid intro/outro fluff. "
+            . "Return JSON object with key clips_plan (array), each item keys: clip_number,title,subtitle_text,start_time,end_time,duration,reason.\n\n"
+            . json_encode([
+                'topic' => $topicHint,
+                'target_duration' => $clipDuration,
+                'segments' => $segments,
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        try {
+            $response = Http::baseUrl($baseUrl)
+                ->timeout(35)
+                ->withToken($openAiKey)
+                ->acceptJson()
+                ->post('/chat/completions', [
+                    'model' => $model,
+                    'temperature' => 0.55,
+                    'response_format' => ['type' => 'json_object'],
+                    'messages' => [
+                        ['role' => 'system', 'content' => $systemPrompt],
+                        ['role' => 'user', 'content' => $userPrompt],
+                    ],
+                ]);
+
+            if ($response->failed()) {
+                Log::warning('AI clip finder request failed', [
+                    'status' => $response->status(),
+                    'body' => Str::limit((string) $response->body(), 1200),
+                ]);
+                return $fallback;
+            }
+
+            $content = (string) data_get($response->json(), 'choices.0.message.content', '');
+            $aiJson = $this->extractJsonFromText($content);
+            if (!$aiJson) {
+                return $fallback;
+            }
+
+            $aiClipsRaw = data_get($aiJson, 'clips_plan', []);
+            $aiClipsRaw = is_array($aiClipsRaw) ? $aiClipsRaw : [];
+            $normalized = $this->normalizeClipPlan($aiClipsRaw, $topicHint, $numClips, $clipDuration);
+
+            // Keep clips inside source duration bounds.
+            foreach ($normalized as &$clip) {
+                $start = max(0.0, min((float) $clip['start_time'], max(0.0, $videoDuration - 5)));
+                $end = max($start + 5, min((float) $clip['end_time'], $videoDuration));
+                $clip['start_time'] = round($start, 2);
+                $clip['end_time'] = round($end, 2);
+                $clip['duration'] = round($end - $start, 2);
+            }
+            unset($clip);
+
+            return $normalized;
+        } catch (\Throwable $e) {
+            Log::warning('AI clip finder exception', ['message' => $e->getMessage()]);
+            return $fallback;
+        }
+    }
+
+    private function transcribeVideoForClipDiscovery(string $sourceVideo, string $ffmpegBin): ?array
+    {
+        $openAiKey = (string) config('services.openai.api_key', '');
+        if ($openAiKey === '') {
+            return null;
+        }
+
+        $baseUrl = rtrim((string) config('services.openai.base_url', 'https://api.openai.com/v1'), '/');
+        $transcribeModel = (string) config('services.openai.transcription_model', 'gpt-4o-mini-transcribe');
+        $tmpAudio = storage_path('app/tmp/autoclipper/' . Str::uuid()->toString() . '.m4a');
+
+        try {
+            File::ensureDirectoryExists(dirname($tmpAudio));
+            $extract = new Process([
+                $ffmpegBin,
+                '-y',
+                '-i',
+                $sourceVideo,
+                '-vn',
+                '-ac',
+                '1',
+                '-ar',
+                '16000',
+                '-b:a',
+                '64k',
+                $tmpAudio,
+            ]);
+            $extract->setTimeout(900);
+            $extract->run();
+
+            if (!$extract->isSuccessful() || !File::exists($tmpAudio) || filesize($tmpAudio) <= 0) {
+                return null;
+            }
+
+            $response = Http::baseUrl($baseUrl)
+                ->timeout(180)
+                ->withToken($openAiKey)
+                ->attach('file', fopen($tmpAudio, 'r'), basename($tmpAudio))
+                ->post('/audio/transcriptions', [
+                    'model' => $transcribeModel,
+                    'response_format' => 'verbose_json',
+                ]);
+
+            if ($response->failed()) {
+                Log::warning('Audio transcription failed', [
+                    'status' => $response->status(),
+                    'body' => Str::limit((string) $response->body(), 1200),
+                ]);
+                return null;
+            }
+
+            $json = $response->json();
+            if (!is_array($json)) {
+                return null;
+            }
+
+            return [
+                'text' => (string) ($json['text'] ?? ''),
+                'segments' => is_array($json['segments'] ?? null) ? $json['segments'] : [],
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('Audio transcription exception', ['message' => $e->getMessage()]);
+            return null;
+        } finally {
+            if (File::exists($tmpAudio)) {
+                @unlink($tmpAudio);
+            }
+        }
+    }
+
+    private function buildPseudoSegmentsFromText(string $text, float $totalDuration): array
+    {
+        $clean = trim(preg_replace('/\s+/', ' ', $text));
+        if ($clean === '') {
+            return [];
+        }
+
+        $chunks = preg_split('/(?<=[\.\!\?])\s+/', $clean) ?: [];
+        $chunks = array_values(array_filter(array_map('trim', $chunks), fn ($t) => $t !== ''));
+        if (empty($chunks)) {
+            $chunks = [mb_substr($clean, 0, 800)];
+        }
+
+        $count = count($chunks);
+        $slice = max(4.0, $totalDuration / max(1, $count));
+        $segments = [];
+        foreach ($chunks as $i => $chunk) {
+            $start = $i * $slice;
+            $end = min($totalDuration, $start + $slice);
+            $segments[] = [
+                'start' => round($start, 2),
+                'end' => round($end, 2),
+                'text' => mb_substr($chunk, 0, 280),
+            ];
+        }
+
+        return $segments;
     }
 
     private function buildAiDiscoveryPlan(
