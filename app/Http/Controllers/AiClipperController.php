@@ -833,9 +833,9 @@ class AiClipperController extends Controller
                             '--smooth',
                             (string) $faceTrackingSmoothness,
                             '--detect-scale',
-                            '0.5',
+                            '0.67',
                             '--detect-interval',
-                            '2',
+                            '1',
                         ]);
                         $track->setEnv([
                             'OMP_NUM_THREADS' => '1',
@@ -1072,11 +1072,22 @@ class AiClipperController extends Controller
                 totalDuration: $videoDuration
             );
         }
+        $segments = $this->normalizeTranscriptSegments($segments, $videoDuration);
         if (empty($segments)) {
             return $fallback;
         }
 
         $segments = array_slice($segments, 0, 350);
+        $heuristicFallback = $this->buildHeuristicClipPlanFromTranscriptSegments(
+            segments: $segments,
+            topic: $topicHint,
+            numClips: $numClips,
+            clipDuration: $clipDuration,
+            videoDuration: $videoDuration
+        );
+        if (empty($heuristicFallback)) {
+            $heuristicFallback = $fallback;
+        }
         $model = $aiModel ?: (string) config('services.openai.model', 'gpt-4o-mini');
         $baseUrl = rtrim((string) config('services.openai.base_url', 'https://api.openai.com/v1'), '/');
 
@@ -1111,17 +1122,25 @@ class AiClipperController extends Controller
                     'status' => $response->status(),
                     'body' => Str::limit((string) $response->body(), 1200),
                 ]);
-                return $fallback;
+                return $heuristicFallback;
             }
 
             $content = (string) data_get($response->json(), 'choices.0.message.content', '');
             $aiJson = $this->extractJsonFromText($content);
             if (!$aiJson) {
-                return $fallback;
+                return $heuristicFallback;
             }
 
             $aiClipsRaw = data_get($aiJson, 'clips_plan', []);
             $aiClipsRaw = is_array($aiClipsRaw) ? $aiClipsRaw : [];
+            if (count($aiClipsRaw) < $numClips) {
+                foreach ($heuristicFallback as $fallbackClip) {
+                    if (count($aiClipsRaw) >= $numClips) {
+                        break;
+                    }
+                    $aiClipsRaw[] = $fallbackClip;
+                }
+            }
             $normalized = $this->normalizeClipPlan(
                 plan: $aiClipsRaw,
                 topic: $topicHint,
@@ -1131,21 +1150,18 @@ class AiClipperController extends Controller
                 minDuration: 18,
                 maxDuration: 95
             );
+            $normalized = $this->alignClipPlanToTranscriptSegments(
+                clips: $normalized,
+                segments: $segments,
+                videoDuration: $videoDuration,
+                minDuration: 14,
+                maxDuration: 95
+            );
 
-            // Keep clips inside source duration bounds.
-            foreach ($normalized as &$clip) {
-                $start = max(0.0, min((float) $clip['start_time'], max(0.0, $videoDuration - 5)));
-                $end = max($start + 5, min((float) $clip['end_time'], $videoDuration));
-                $clip['start_time'] = round($start, 2);
-                $clip['end_time'] = round($end, 2);
-                $clip['duration'] = round($end - $start, 2);
-            }
-            unset($clip);
-
-            return $normalized;
+            return !empty($normalized) ? $normalized : $heuristicFallback;
         } catch (\Throwable $e) {
             Log::warning('AI clip finder exception', ['message' => $e->getMessage()]);
-            return $fallback;
+            return $heuristicFallback;
         }
     }
 
@@ -1467,6 +1483,520 @@ class AiClipperController extends Controller
         }
 
         return $normalized;
+    }
+
+    private function normalizeTranscriptSegments(array $segments, float $videoDuration): array
+    {
+        $safeDuration = max(1.0, $videoDuration);
+        $normalized = [];
+
+        foreach ($segments as $index => $segment) {
+            if (!is_array($segment)) {
+                continue;
+            }
+
+            $startRaw = $segment['start'] ?? $segment['start_time'] ?? null;
+            $endRaw = $segment['end'] ?? $segment['end_time'] ?? null;
+            if (!is_numeric($startRaw) || !is_numeric($endRaw)) {
+                continue;
+            }
+
+            $start = (float) $startRaw;
+            $end = (float) $endRaw;
+            if ($end <= $start) {
+                continue;
+            }
+
+            $start = max(0.0, min($start, max(0.0, $safeDuration - 0.1)));
+            $end = max($start + 0.1, min($end, $safeDuration));
+            $text = trim((string) ($segment['text'] ?? $segment['transcript'] ?? ''));
+            $text = trim((string) preg_replace('/\s+/u', ' ', $text));
+            if ($text === '') {
+                continue;
+            }
+
+            $normalized[] = [
+                'start' => round($start, 2),
+                'end' => round($end, 2),
+                'duration' => round($end - $start, 2),
+                'text' => $text,
+                'index' => (int) $index,
+            ];
+        }
+
+        usort($normalized, fn ($a, $b) => ($a['start'] <=> $b['start']));
+
+        return array_values($normalized);
+    }
+
+    private function scoreTranscriptSegment(string $text, float $start, float $end, float $videoDuration): float
+    {
+        $clean = trim((string) preg_replace('/\s+/u', ' ', mb_strtolower($text)));
+        if ($clean === '') {
+            return -1.0;
+        }
+
+        $score = 0.0;
+        $length = mb_strlen($clean);
+        $score += min(0.75, $length / 220.0);
+
+        $punctuation = preg_match_all('/[\?\!]/u', $clean, $matches);
+        $score += min(0.35, ((int) $punctuation) * 0.08);
+
+        if (preg_match('/\d/u', $clean)) {
+            $score += 0.12;
+        }
+
+        $positiveKeywords = [
+            'kenapa',
+            'gimana',
+            'bagaimana',
+            'masalah',
+            'kontrovers',
+            'ternyata',
+            'fakta',
+            'rahasia',
+            'insight',
+            'strategi',
+            'pelajaran',
+            'kesalahan',
+            'gagal',
+            'sukses',
+            'uang',
+            'bisnis',
+            'peluang',
+            'viral',
+            'penting',
+            'wow',
+            'serius',
+            'kunci',
+            'tips',
+            'bukti',
+            'menarik',
+            'jutaan',
+        ];
+        foreach ($positiveKeywords as $keyword) {
+            if (str_contains($clean, $keyword)) {
+                $score += 0.08;
+            }
+        }
+
+        $negativeKeywords = [
+            'subscribe',
+            'jangan lupa like',
+            'terima kasih sudah menonton',
+            'sampai jumpa',
+            'opening',
+            'intro',
+            'outro',
+            'sponsor',
+            'iklan',
+            'promosi',
+        ];
+        foreach ($negativeKeywords as $keyword) {
+            if (str_contains($clean, $keyword)) {
+                $score -= 0.2;
+            }
+        }
+
+        $position = $videoDuration > 0.0 ? ($start / max(1.0, $videoDuration)) : 0.5;
+        if ($position < 0.05 || $position > 0.95) {
+            $score -= 0.35;
+        } elseif ($position < 0.1 || $position > 0.9) {
+            $score -= 0.12;
+        }
+
+        $segmentDuration = max(0.1, $end - $start);
+        if ($segmentDuration > 12.0) {
+            $score += 0.08;
+        }
+
+        return $score;
+    }
+
+    private function buildClipTextLabel(string $text, string $topic, int $clipNumber): array
+    {
+        $clean = trim((string) preg_replace('/\s+/u', ' ', $text));
+        $clean = trim((string) preg_replace('/^[\-\:\,\.\s]+|[\-\:\,\.\s]+$/u', '', $clean));
+
+        if ($clean === '') {
+            $fallbackTitle = $topic . ' - Clip ' . $clipNumber;
+            return [
+                'title' => $fallbackTitle,
+                'subtitle_text' => $fallbackTitle,
+            ];
+        }
+
+        $words = preg_split('/\s+/u', $clean) ?: [];
+        $title = trim(implode(' ', array_slice($words, 0, 8)));
+        if ($title === '') {
+            $title = $topic . ' - Clip ' . $clipNumber;
+        }
+
+        return [
+            'title' => Str::limit($title, 80, ''),
+            'subtitle_text' => Str::limit($clean, 120),
+        ];
+    }
+
+    private function overlapRatio(float $aStart, float $aEnd, float $bStart, float $bEnd): float
+    {
+        $overlap = max(0.0, min($aEnd, $bEnd) - max($aStart, $bStart));
+        if ($overlap <= 0.0) {
+            return 0.0;
+        }
+        $shortest = max(0.1, min($aEnd - $aStart, $bEnd - $bStart));
+
+        return $overlap / $shortest;
+    }
+
+    private function buildHeuristicClipPlanFromTranscriptSegments(
+        array $segments,
+        string $topic,
+        int $numClips,
+        int $clipDuration,
+        float $videoDuration
+    ): array {
+        if (empty($segments)) {
+            return [];
+        }
+
+        $minDuration = 14.0;
+        $maxDuration = 95.0;
+        $preferredDuration = (float) max(22, min($clipDuration, 65));
+
+        $scoredSegments = [];
+        foreach ($segments as $segment) {
+            if (!is_array($segment)) {
+                continue;
+            }
+            $start = (float) ($segment['start'] ?? 0.0);
+            $end = (float) ($segment['end'] ?? 0.0);
+            $text = (string) ($segment['text'] ?? '');
+            $score = $this->scoreTranscriptSegment($text, $start, $end, $videoDuration);
+            $segment['score'] = $score;
+            $scoredSegments[] = $segment;
+        }
+
+        $segmentCount = count($scoredSegments);
+        if ($segmentCount === 0) {
+            return [];
+        }
+
+        $candidates = [];
+        for ($i = 0; $i < $segmentCount; $i++) {
+            $anchor = $scoredSegments[$i];
+            if (($anchor['score'] ?? -1.0) < 0.04) {
+                continue;
+            }
+
+            $left = $i;
+            $right = $i;
+            $scoreSum = (float) ($anchor['score'] ?? 0.0);
+            $included = 1;
+            $windowStart = (float) ($anchor['start'] ?? 0.0);
+            $windowEnd = (float) ($anchor['end'] ?? $windowStart);
+
+            while (($windowEnd - $windowStart) < $preferredDuration && ($left > 0 || $right < ($segmentCount - 1))) {
+                $leftCandidate = null;
+                if ($left > 0) {
+                    $segment = $scoredSegments[$left - 1];
+                    $gap = max(0.0, $windowStart - (float) ($segment['end'] ?? 0.0));
+                    $leftCandidate = [
+                        'direction' => 'left',
+                        'value' => (float) ($segment['score'] ?? 0.0) - ($gap * 0.15),
+                        'segment' => $segment,
+                    ];
+                }
+
+                $rightCandidate = null;
+                if ($right < ($segmentCount - 1)) {
+                    $segment = $scoredSegments[$right + 1];
+                    $gap = max(0.0, (float) ($segment['start'] ?? 0.0) - $windowEnd);
+                    $rightCandidate = [
+                        'direction' => 'right',
+                        'value' => (float) ($segment['score'] ?? 0.0) - ($gap * 0.15),
+                        'segment' => $segment,
+                    ];
+                }
+
+                $pick = null;
+                if ($leftCandidate && $rightCandidate) {
+                    $pick = $leftCandidate['value'] >= $rightCandidate['value'] ? $leftCandidate : $rightCandidate;
+                } elseif ($leftCandidate) {
+                    $pick = $leftCandidate;
+                } elseif ($rightCandidate) {
+                    $pick = $rightCandidate;
+                }
+
+                if (!$pick) {
+                    break;
+                }
+                if ($pick['value'] < -0.25 && ($windowEnd - $windowStart) >= $minDuration) {
+                    break;
+                }
+
+                if ($pick['direction'] === 'left') {
+                    $left--;
+                    $windowStart = (float) ($pick['segment']['start'] ?? $windowStart);
+                } else {
+                    $right++;
+                    $windowEnd = (float) ($pick['segment']['end'] ?? $windowEnd);
+                }
+
+                $scoreSum += (float) ($pick['segment']['score'] ?? 0.0);
+                $included++;
+                if (($windowEnd - $windowStart) >= $maxDuration) {
+                    break;
+                }
+            }
+
+            while (($windowEnd - $windowStart) < $minDuration && ($left > 0 || $right < ($segmentCount - 1))) {
+                $leftGap = $left > 0
+                    ? max(0.0, $windowStart - (float) ($scoredSegments[$left - 1]['end'] ?? 0.0))
+                    : INF;
+                $rightGap = $right < ($segmentCount - 1)
+                    ? max(0.0, (float) ($scoredSegments[$right + 1]['start'] ?? 0.0) - $windowEnd)
+                    : INF;
+
+                if ($leftGap <= $rightGap && $left > 0) {
+                    $left--;
+                    $segment = $scoredSegments[$left];
+                    $windowStart = (float) ($segment['start'] ?? $windowStart);
+                    $scoreSum += (float) ($segment['score'] ?? 0.0);
+                    $included++;
+                } elseif ($right < ($segmentCount - 1)) {
+                    $right++;
+                    $segment = $scoredSegments[$right];
+                    $windowEnd = (float) ($segment['end'] ?? $windowEnd);
+                    $scoreSum += (float) ($segment['score'] ?? 0.0);
+                    $included++;
+                } else {
+                    break;
+                }
+            }
+
+            $windowStart = max(0.0, $windowStart - 0.35);
+            $windowEnd = min($videoDuration, $windowEnd + 0.5);
+            if ($windowEnd <= $windowStart) {
+                continue;
+            }
+
+            $windowDuration = $windowEnd - $windowStart;
+            if ($windowDuration > $maxDuration) {
+                $center = ($windowStart + $windowEnd) / 2.0;
+                $windowStart = max(0.0, $center - ($maxDuration / 2.0));
+                $windowEnd = min($videoDuration, $windowStart + $maxDuration);
+                $windowStart = max(0.0, $windowEnd - $maxDuration);
+            } elseif ($windowDuration < $minDuration) {
+                $center = ($windowStart + $windowEnd) / 2.0;
+                $windowStart = max(0.0, $center - ($minDuration / 2.0));
+                $windowEnd = min($videoDuration, $windowStart + $minDuration);
+                $windowStart = max(0.0, $windowEnd - $minDuration);
+            }
+
+            $windowDuration = max(0.1, $windowEnd - $windowStart);
+            $averageScore = $scoreSum / max(1, $included);
+            $anchorScore = (float) ($anchor['score'] ?? 0.0);
+            $candidateScore = ($anchorScore * 1.3)
+                + $averageScore
+                + min(0.4, ($windowDuration / max(1.0, $preferredDuration)) * 0.3);
+
+            $candidates[] = [
+                'start_time' => round($windowStart, 2),
+                'end_time' => round($windowEnd, 2),
+                'duration' => round($windowDuration, 2),
+                'score' => $candidateScore,
+                'text' => (string) ($anchor['text'] ?? ''),
+            ];
+        }
+
+        if (empty($candidates)) {
+            return [];
+        }
+
+        usort($candidates, fn ($a, $b) => ($b['score'] <=> $a['score']));
+
+        $selected = [];
+        foreach ($candidates as $candidate) {
+            $overlapDetected = false;
+            foreach ($selected as $existing) {
+                $ratio = $this->overlapRatio(
+                    (float) $candidate['start_time'],
+                    (float) $candidate['end_time'],
+                    (float) $existing['start_time'],
+                    (float) $existing['end_time']
+                );
+                if ($ratio > 0.58) {
+                    $overlapDetected = true;
+                    break;
+                }
+            }
+            if ($overlapDetected) {
+                continue;
+            }
+            $selected[] = $candidate;
+            if (count($selected) >= $numClips) {
+                break;
+            }
+        }
+
+        if (count($selected) < $numClips) {
+            $fallback = $this->normalizeClipPlan(
+                plan: [],
+                topic: $topic,
+                numClips: $numClips,
+                clipDuration: $clipDuration,
+                useFixedDuration: false,
+                minDuration: 18,
+                maxDuration: 95
+            );
+            foreach ($fallback as $item) {
+                if (count($selected) >= $numClips) {
+                    break;
+                }
+                $start = (float) ($item['start_time'] ?? 0.0);
+                $end = (float) ($item['end_time'] ?? 0.0);
+                $hasOverlap = false;
+                foreach ($selected as $existing) {
+                    if ($this->overlapRatio($start, $end, (float) $existing['start_time'], (float) $existing['end_time']) > 0.75) {
+                        $hasOverlap = true;
+                        break;
+                    }
+                }
+                if ($hasOverlap) {
+                    continue;
+                }
+                $selected[] = [
+                    'start_time' => $start,
+                    'end_time' => $end,
+                    'duration' => max(0.1, $end - $start),
+                    'score' => -0.5,
+                    'text' => (string) ($item['title'] ?? ''),
+                ];
+            }
+        }
+
+        $clips = [];
+        foreach (array_values($selected) as $index => $candidate) {
+            $clipNumber = $index + 1;
+            $label = $this->buildClipTextLabel((string) ($candidate['text'] ?? ''), $topic, $clipNumber);
+            $clips[] = [
+                'clip_number' => $clipNumber,
+                'title' => $label['title'],
+                'subtitle_text' => $label['subtitle_text'],
+                'start_time' => round((float) $candidate['start_time'], 2),
+                'end_time' => round((float) $candidate['end_time'], 2),
+                'duration' => round(max(0.1, ((float) $candidate['end_time'] - (float) $candidate['start_time'])), 2),
+                'reason' => 'Dipilih karena hook obrolan kuat dan tetap mengikuti alur percakapan natural.',
+            ];
+        }
+
+        $clips = $this->normalizeClipPlan(
+            plan: $clips,
+            topic: $topic,
+            numClips: $numClips,
+            clipDuration: $clipDuration,
+            useFixedDuration: false,
+            minDuration: 14,
+            maxDuration: 95
+        );
+
+        return $this->alignClipPlanToTranscriptSegments(
+            clips: $clips,
+            segments: $segments,
+            videoDuration: $videoDuration,
+            minDuration: 14,
+            maxDuration: 95
+        );
+    }
+
+    private function alignClipPlanToTranscriptSegments(
+        array $clips,
+        array $segments,
+        float $videoDuration,
+        int $minDuration = 14,
+        int $maxDuration = 95
+    ): array {
+        if (empty($clips)) {
+            return [];
+        }
+
+        $safeVideoDuration = max(1.0, $videoDuration);
+        $aligned = [];
+
+        foreach ($clips as $index => $clip) {
+            if (!is_array($clip)) {
+                continue;
+            }
+
+            $start = isset($clip['start_time']) && is_numeric($clip['start_time'])
+                ? (float) $clip['start_time']
+                : 0.0;
+            $end = isset($clip['end_time']) && is_numeric($clip['end_time'])
+                ? (float) $clip['end_time']
+                : ($start + max(5.0, (float) $minDuration));
+
+            $start = max(0.0, min($start, max(0.0, $safeVideoDuration - 0.1)));
+            $end = max($start + 0.1, min($end, $safeVideoDuration));
+
+            $matchingSegments = array_values(array_filter(
+                $segments,
+                fn ($segment) => (float) ($segment['end'] ?? 0.0) > $start && (float) ($segment['start'] ?? 0.0) < $end
+            ));
+
+            if (empty($matchingSegments) && !empty($segments)) {
+                $center = ($start + $end) / 2.0;
+                usort($segments, function ($a, $b) use ($center) {
+                    $aCenter = ((float) ($a['start'] ?? 0.0) + (float) ($a['end'] ?? 0.0)) / 2.0;
+                    $bCenter = ((float) ($b['start'] ?? 0.0) + (float) ($b['end'] ?? 0.0)) / 2.0;
+                    return abs($aCenter - $center) <=> abs($bCenter - $center);
+                });
+                $matchingSegments = array_slice($segments, 0, 2);
+            }
+
+            if (!empty($matchingSegments)) {
+                $start = min(array_map(fn ($segment) => (float) ($segment['start'] ?? 0.0), $matchingSegments));
+                $end = max(array_map(fn ($segment) => (float) ($segment['end'] ?? 0.0), $matchingSegments));
+                $start = max(0.0, $start - 0.25);
+                $end = min($safeVideoDuration, $end + 0.45);
+            }
+
+            $duration = $end - $start;
+            if ($duration > $maxDuration) {
+                $center = ($start + $end) / 2.0;
+                $start = max(0.0, $center - ($maxDuration / 2.0));
+                $end = min($safeVideoDuration, $start + $maxDuration);
+                $start = max(0.0, $end - $maxDuration);
+            } elseif ($duration < $minDuration) {
+                $center = ($start + $end) / 2.0;
+                $start = max(0.0, $center - ($minDuration / 2.0));
+                $end = min($safeVideoDuration, $start + $minDuration);
+                $start = max(0.0, $end - $minDuration);
+            }
+
+            $clip['clip_number'] = is_numeric($clip['clip_number'] ?? null)
+                ? (int) $clip['clip_number']
+                : ($index + 1);
+            $clip['start_time'] = round($start, 2);
+            $clip['end_time'] = round(max($start + 0.1, $end), 2);
+            $clip['duration'] = round($clip['end_time'] - $clip['start_time'], 2);
+
+            if (trim((string) ($clip['reason'] ?? '')) === '') {
+                $clip['reason'] = 'Segment diselaraskan ke batas percakapan agar durasi natural.';
+            }
+
+            $aligned[] = $clip;
+        }
+
+        usort($aligned, fn ($a, $b) => ((float) $a['start_time'] <=> (float) $b['start_time']));
+
+        foreach ($aligned as $idx => &$clip) {
+            $clip['clip_number'] = $idx + 1;
+        }
+        unset($clip);
+
+        return $aligned;
     }
 
     private function normalizePodcastQuery(string $query, string $topic, string $excludeTerms): string
