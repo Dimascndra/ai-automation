@@ -374,6 +374,8 @@ class AiClipperController extends Controller
             'callback_url' => 'nullable|url',
             'fact_check_notes' => 'nullable|string',
             'source_podcast_query' => 'nullable|string',
+            'face_tracking' => 'nullable|boolean',
+            'face_tracking_smoothness' => 'nullable|numeric|min:0.5|max:0.98',
             'clips_plan' => 'nullable|array',
             'clips_plan.*.clip_number' => 'nullable|integer|min:1',
             'clips_plan.*.title' => 'nullable|string|max:255',
@@ -400,10 +402,17 @@ class AiClipperController extends Controller
         $ffmpegConfigured = (string) config('services.n8n.ffmpeg_bin', 'ffmpeg');
         $ffprobeConfigured = (string) config('services.n8n.ffprobe_bin', 'ffprobe');
         $ytDlpConfigured = (string) config('services.n8n.ytdlp_bin', 'yt-dlp');
+        $pythonConfigured = (string) config('services.n8n.python_bin', 'python3');
+        $faceTrackingEnabled = $request->boolean('face_tracking', true);
+        $faceTrackingSmoothness = (float) $request->input('face_tracking_smoothness', 0.88);
+        $faceTrackingSmoothness = max(0.5, min($faceTrackingSmoothness, 0.98));
 
         $ffmpegBin = $this->resolveBinaryPath($ffmpegConfigured, ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']);
         $ffprobeBin = $this->resolveBinaryPath($ffprobeConfigured, ['/usr/bin/ffprobe', '/usr/local/bin/ffprobe']);
         $ytDlpBin = $this->resolveBinaryPath($ytDlpConfigured, ['/usr/local/bin/yt-dlp', '/usr/bin/yt-dlp']);
+        $pythonBin = $this->resolveBinaryPath($pythonConfigured, ['/usr/bin/python3', '/usr/local/bin/python3', '/usr/bin/python']);
+        $faceTrackingScript = base_path('scripts/face_track_reframe.py');
+        $canUseFaceTracking = $faceTrackingEnabled && $pythonBin && File::exists($faceTrackingScript);
 
         if (!$ffmpegBin || !$ffprobeBin || !$ytDlpBin) {
             return response()->json([
@@ -621,12 +630,57 @@ class AiClipperController extends Controller
             }
             $fontPart = File::exists($subtitleFont) ? 'fontfile=' . $subtitleFont . ':' : '';
 
+            if ($faceTrackingEnabled && !$canUseFaceTracking) {
+                Log::warning('Face tracking requested but unavailable. Falling back to center crop.', [
+                    'task_id' => $taskId,
+                    'python' => $pythonBin,
+                    'script' => $faceTrackingScript,
+                ]);
+            }
+
             foreach ($segments as $segment) {
                 $clipNumber = $segment['clip_number'];
                 $tmpOutput = $tmpDir . DIRECTORY_SEPARATOR . 'clip-' . $clipNumber . '.mp4';
+                $segmentSource = $tmpDir . DIRECTORY_SEPARATOR . 'segment-' . $clipNumber . '.mp4';
                 $subtitleText = $this->escapeDrawtextText((string) ($segment['subtitle_text'] ?? $segment['title'] ?? 'Podcast Clip'));
                 $segmentRendered = false;
                 $attemptErrors = [];
+                $trackingAppliedForSegment = false;
+
+                $cutSegment = new Process([
+                    $ffmpegBin,
+                    '-y',
+                    '-ss',
+                    (string) round($segment['start_time'], 3),
+                    '-to',
+                    (string) round($segment['end_time'], 3),
+                    '-i',
+                    $sourceVideo,
+                    '-c:v',
+                    'libx264',
+                    '-preset',
+                    'ultrafast',
+                    '-crf',
+                    '30',
+                    '-threads',
+                    '1',
+                    '-c:a',
+                    'aac',
+                    '-movflags',
+                    '+faststart',
+                    $segmentSource,
+                ]);
+                $cutSegment->setTimeout(600);
+                $cutSegment->run();
+
+                if (!$cutSegment->isSuccessful() || !File::exists($segmentSource) || filesize($segmentSource) <= 0) {
+                    $renderErrors[] = [
+                        'clip_number' => $clipNumber,
+                        'error' => 'Failed to extract segment before render.',
+                        'details' => Str::limit(trim($cutSegment->getErrorOutput() ?: $cutSegment->getOutput()), 1200),
+                    ];
+                    continue;
+                }
 
                 foreach ($renderProfiles as $profile) {
                     if (File::exists($tmpOutput)) {
@@ -649,37 +703,98 @@ class AiClipperController extends Controller
                         . 'line_spacing=8:'
                         . 'x=(w-text_w)/2:y=h-text_h-' . $subtitleBottom;
 
-                    $ffmpegCommand = [
-                        $ffmpegBin,
-                        '-y',
-                        '-ss',
-                        (string) round($segment['start_time'], 3),
-                        '-to',
-                        (string) round($segment['end_time'], 3),
-                        '-i',
-                        $sourceVideo,
-                    ];
+                    $trackedVideo = $tmpDir . DIRECTORY_SEPARATOR . 'tracked-' . $clipNumber . '-' . $targetWidth . 'x' . $targetHeight . '.mp4';
+                    $useTrackedVideo = false;
+                    $trackingError = null;
 
-                    if ($watermarkPath) {
+                    if ($canUseFaceTracking) {
+                        if (File::exists($trackedVideo)) {
+                            File::delete($trackedVideo);
+                        }
+
+                        $track = new Process([
+                            $pythonBin,
+                            $faceTrackingScript,
+                            '--input',
+                            $segmentSource,
+                            '--output',
+                            $trackedVideo,
+                            '--width',
+                            (string) $targetWidth,
+                            '--height',
+                            (string) $targetHeight,
+                            '--smooth',
+                            (string) $faceTrackingSmoothness,
+                        ]);
+                        $track->setTimeout(900);
+                        $track->run();
+
+                        if ($track->isSuccessful() && File::exists($trackedVideo) && filesize($trackedVideo) > 0) {
+                            $useTrackedVideo = true;
+                            $trackingAppliedForSegment = true;
+                        } else {
+                            $trackingError = Str::limit(trim($track->getErrorOutput() ?: $track->getOutput()), 900);
+                        }
+                    }
+
+                    $ffmpegCommand = [$ffmpegBin, '-y'];
+
+                    if ($useTrackedVideo) {
                         $ffmpegCommand = array_merge($ffmpegCommand, [
                             '-i',
-                            $watermarkPath,
-                            '-filter_complex',
-                            '[0:v]' . $portraitFilter . ',' . $subtitleFilter . '[sub];[1:v]scale=iw*0.2:-1[wm];[sub][wm]overlay=W-w-20:H-h-20[vout]',
-                            '-map',
-                            '[vout]',
-                            '-map',
-                            '0:a?',
+                            $trackedVideo,
+                            '-i',
+                            $segmentSource,
                         ]);
+
+                        if ($watermarkPath) {
+                            $ffmpegCommand = array_merge($ffmpegCommand, [
+                                '-i',
+                                $watermarkPath,
+                                '-filter_complex',
+                                '[0:v]' . $subtitleFilter . '[sub];[2:v]scale=iw*0.2:-1[wm];[sub][wm]overlay=W-w-20:H-h-20[vout]',
+                                '-map',
+                                '[vout]',
+                                '-map',
+                                '1:a?',
+                            ]);
+                        } else {
+                            $ffmpegCommand = array_merge($ffmpegCommand, [
+                                '-vf',
+                                $subtitleFilter,
+                                '-map',
+                                '0:v:0',
+                                '-map',
+                                '1:a?',
+                            ]);
+                        }
                     } else {
                         $ffmpegCommand = array_merge($ffmpegCommand, [
-                            '-vf',
-                            $portraitFilter . ',' . $subtitleFilter,
-                            '-map',
-                            '0:v:0',
-                            '-map',
-                            '0:a?',
+                            '-i',
+                            $segmentSource,
                         ]);
+
+                        if ($watermarkPath) {
+                            $ffmpegCommand = array_merge($ffmpegCommand, [
+                                '-i',
+                                $watermarkPath,
+                                '-filter_complex',
+                                '[0:v]' . $portraitFilter . ',' . $subtitleFilter . '[sub];[1:v]scale=iw*0.2:-1[wm];[sub][wm]overlay=W-w-20:H-h-20[vout]',
+                                '-map',
+                                '[vout]',
+                                '-map',
+                                '0:a?',
+                            ]);
+                        } else {
+                            $ffmpegCommand = array_merge($ffmpegCommand, [
+                                '-vf',
+                                $portraitFilter . ',' . $subtitleFilter,
+                                '-map',
+                                '0:v:0',
+                                '-map',
+                                '0:a?',
+                            ]);
+                        }
                     }
 
                     $ffmpegCommand = array_merge($ffmpegCommand, [
@@ -713,6 +828,8 @@ class AiClipperController extends Controller
                     $attemptErrors[] = [
                         'resolution' => $targetWidth . 'x' . $targetHeight,
                         'preset' => (string) $profile['preset'],
+                        'face_tracking' => $useTrackedVideo,
+                        'face_tracking_error' => $trackingError,
                         'error' => Str::limit(trim($render->getErrorOutput() ?: $render->getOutput()), 1200),
                     ];
                 }
@@ -731,6 +848,7 @@ class AiClipperController extends Controller
 
                 $relativePublicPath = $taskDirRelative . '/clip-' . $clipNumber . '.mp4';
                 $segment['video_clip_url'] = asset('storage/' . $relativePublicPath);
+                $segment['face_tracking'] = $trackingAppliedForSegment ? 'applied' : 'center_crop_fallback';
                 $renderedClips[] = $segment;
             }
 
