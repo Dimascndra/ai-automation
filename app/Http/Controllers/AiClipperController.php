@@ -713,11 +713,17 @@ class AiClipperController extends Controller
 
             $renderedClips = [];
             $renderErrors = [];
-            $renderProfiles = [
-                ['width' => 1080, 'height' => 1920, 'preset' => 'faster', 'crf' => '18', 'threads' => '2'],
-                ['width' => 900, 'height' => 1600, 'preset' => 'veryfast', 'crf' => '19', 'threads' => '1'],
-                ['width' => 720, 'height' => 1280, 'preset' => 'veryfast', 'crf' => '20', 'threads' => '1'],
-            ];
+            $renderProfiles = $canUseFaceTracking
+                ? [
+                    ['width' => 1080, 'height' => 1920, 'preset' => 'veryfast', 'crf' => '18', 'threads' => '1'],
+                    ['width' => 900, 'height' => 1600, 'preset' => 'veryfast', 'crf' => '18', 'threads' => '1'],
+                    ['width' => 720, 'height' => 1280, 'preset' => 'veryfast', 'crf' => '19', 'threads' => '1'],
+                ]
+                : [
+                    ['width' => 1080, 'height' => 1920, 'preset' => 'faster', 'crf' => '18', 'threads' => '2'],
+                    ['width' => 900, 'height' => 1600, 'preset' => 'veryfast', 'crf' => '19', 'threads' => '1'],
+                    ['width' => 720, 'height' => 1280, 'preset' => 'veryfast', 'crf' => '20', 'threads' => '1'],
+                ];
             $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
             if (!File::exists($subtitleFont)) {
                 $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
@@ -735,12 +741,13 @@ class AiClipperController extends Controller
             foreach ($segments as $segment) {
                 $clipNumber = $segment['clip_number'];
                 $tmpOutput = $tmpDir . DIRECTORY_SEPARATOR . 'clip-' . $clipNumber . '.mp4';
-                $segmentSource = $tmpDir . DIRECTORY_SEPARATOR . 'segment-' . $clipNumber . '.mp4';
+                $trackingSource = $tmpDir . DIRECTORY_SEPARATOR . 'tracking-source-' . $clipNumber . '.mp4';
                 $subtitleText = $this->escapeDrawtextText((string) ($segment['subtitle_text'] ?? $segment['title'] ?? 'Podcast Clip'));
                 $segmentRendered = false;
                 $attemptErrors = [];
                 $trackingAppliedForSegment = false;
                 $segmentSourceAvailable = false;
+                $trackingPreparationError = null;
                 if ($canUseFaceTracking) {
                     $cutSegment = new Process([
                         $ffmpegBin,
@@ -751,30 +758,30 @@ class AiClipperController extends Controller
                         (string) round($segment['end_time'], 3),
                         '-i',
                         $sourceVideo,
+                        '-an',
                         '-c:v',
                         'libx264',
                         '-preset',
                         'veryfast',
                         '-crf',
-                        '18',
+                        '23',
                         '-threads',
                         '1',
-                        '-c:a',
-                        'aac',
                         '-movflags',
                         '+faststart',
-                        $segmentSource,
+                        $trackingSource,
                     ]);
                     $cutSegment->setTimeout(600);
                     $cutSegment->run();
 
-                    if (!$cutSegment->isSuccessful() || !File::exists($segmentSource) || filesize($segmentSource) <= 0) {
-                        $renderErrors[] = [
-                            'clip_number' => $clipNumber,
-                            'error' => 'Failed to extract segment for face tracking.',
-                            'details' => Str::limit(trim($cutSegment->getErrorOutput() ?: $cutSegment->getOutput()), 1200),
-                        ];
+                    if (!$cutSegment->isSuccessful() || !File::exists($trackingSource) || filesize($trackingSource) <= 0) {
+                        $trackingPreparationError = Str::limit(trim($cutSegment->getErrorOutput() ?: $cutSegment->getOutput()), 1200);
                         if ($faceTrackingRequired) {
+                            $renderErrors[] = [
+                                'clip_number' => $clipNumber,
+                                'error' => 'Failed to prepare face tracking source segment.',
+                                'details' => $trackingPreparationError,
+                            ];
                             continue;
                         }
                     } else {
@@ -803,9 +810,9 @@ class AiClipperController extends Controller
                         . 'line_spacing=8:'
                         . 'x=(w-text_w)/2:y=h-text_h-' . $subtitleBottom;
 
-                    $trackedVideo = $tmpDir . DIRECTORY_SEPARATOR . 'tracked-' . $clipNumber . '-' . $targetWidth . 'x' . $targetHeight . '.mp4';
+                    $trackedVideo = $tmpDir . DIRECTORY_SEPARATOR . 'tracked-' . $clipNumber . '-' . $targetWidth . 'x' . $targetHeight . '.avi';
                     $useTrackedVideo = false;
-                    $trackingError = null;
+                    $trackingError = $trackingPreparationError;
 
                     if ($canUseFaceTracking && $segmentSourceAvailable) {
                         if (File::exists($trackedVideo)) {
@@ -816,7 +823,7 @@ class AiClipperController extends Controller
                             $pythonBin,
                             $faceTrackingScript,
                             '--input',
-                            $segmentSource,
+                            $trackingSource,
                             '--output',
                             $trackedVideo,
                             '--width',
@@ -826,9 +833,9 @@ class AiClipperController extends Controller
                             '--smooth',
                             (string) $faceTrackingSmoothness,
                             '--detect-scale',
-                            '0.4',
+                            '0.5',
                             '--detect-interval',
-                            '4',
+                            '2',
                         ]);
                         $track->setEnv([
                             'OMP_NUM_THREADS' => '1',
@@ -867,8 +874,12 @@ class AiClipperController extends Controller
                         $ffmpegCommand = array_merge($ffmpegCommand, [
                             '-i',
                             $trackedVideo,
+                            '-ss',
+                            (string) round($segment['start_time'], 3),
+                            '-to',
+                            (string) round($segment['end_time'], 3),
                             '-i',
-                            $segmentSource,
+                            $sourceVideo,
                         ]);
 
                         if ($watermarkPath) {
@@ -893,21 +904,14 @@ class AiClipperController extends Controller
                             ]);
                         }
                     } else {
-                        if ($segmentSourceAvailable) {
-                            $ffmpegCommand = array_merge($ffmpegCommand, [
-                                '-i',
-                                $segmentSource,
-                            ]);
-                        } else {
-                            $ffmpegCommand = array_merge($ffmpegCommand, [
-                                '-ss',
-                                (string) round($segment['start_time'], 3),
-                                '-to',
-                                (string) round($segment['end_time'], 3),
-                                '-i',
-                                $sourceVideo,
-                            ]);
-                        }
+                        $ffmpegCommand = array_merge($ffmpegCommand, [
+                            '-ss',
+                            (string) round($segment['start_time'], 3),
+                            '-to',
+                            (string) round($segment['end_time'], 3),
+                            '-i',
+                            $sourceVideo,
+                        ]);
 
                         if ($watermarkPath) {
                             $ffmpegCommand = array_merge($ffmpegCommand, [
