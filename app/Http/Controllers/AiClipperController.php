@@ -180,7 +180,7 @@ class AiClipperController extends Controller
                 'payload' => $payload,
             ]);
 
-            $httpClient = Http::timeout(30)->asJson();
+            $httpClient = Http::connectTimeout(10)->timeout(60)->asJson();
             if (!empty($n8nApiKey)) {
                 $httpClient = $httpClient->withHeaders([
                     'x-api-key' => $n8nApiKey,
@@ -216,12 +216,17 @@ class AiClipperController extends Controller
                 'task' => $task
             ]);
         } catch (\Exception $e) {
+            $message = $e->getMessage();
+            if (str_contains($message, 'cURL error 28') && str_contains($n8nWebhookUrl, '/webhook-test/')) {
+                $message .= ' | Gunakan URL production webhook `/webhook/...` atau ubah n8n Webhook node ke responseMode `onReceived` agar tidak timeout.';
+            }
+
             $task->update([
                 'status' => 'failed',
-                'ai_summary' => 'Connection failed: ' . $e->getMessage(),
+                'ai_summary' => 'Connection failed: ' . $message,
             ]);
-            Log::error('Controller Error:', ['message' => $e->getMessage()]);
-            return response()->json(['status' => 'error', 'message' => 'Koneksi Gagal: ' . $e->getMessage()], 500);
+            Log::error('Controller Error:', ['message' => $message]);
+            return response()->json(['status' => 'error', 'message' => 'Koneksi Gagal: ' . $message], 500);
         }
     }
 
@@ -372,6 +377,7 @@ class AiClipperController extends Controller
             'clips_plan' => 'nullable|array',
             'clips_plan.*.clip_number' => 'nullable|integer|min:1',
             'clips_plan.*.title' => 'nullable|string|max:255',
+            'clips_plan.*.subtitle_text' => 'nullable|string|max:500',
             'clips_plan.*.start_time' => 'nullable|numeric|min:0',
             'clips_plan.*.end_time' => 'nullable|numeric|min:0',
             'clips_plan.*.duration' => 'nullable|numeric|min:1',
@@ -428,20 +434,50 @@ class AiClipperController extends Controller
             $sourceTemplate = $tmpDir . DIRECTORY_SEPARATOR . 'source.%(ext)s';
             $sourceInput = $youtubeUrl;
             if ($isAutoDiscovery) {
-                $searchTopic = trim((string) $request->input('topic_hint', 'trending indonesia hari ini'));
-                $searchQuery = $searchTopic !== '' ? $searchTopic : 'trending indonesia hari ini';
-                $sourceInput = 'ytsearch1:' . $searchQuery;
+                $searchQuery = trim((string) $request->input('source_podcast_query', ''));
+                if ($searchQuery === '') {
+                    $searchTopic = trim((string) $request->input('topic_hint', 'teknologi'));
+                    $searchQuery = 'podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia';
+                }
+
+                if (!preg_match('/\bpodcast\b/i', $searchQuery)) {
+                    $searchQuery = 'podcast ' . $searchQuery;
+                }
+
+                $excludeTerms = '-pertandingan -live -highlight -highlights -gol -goal';
+                $finalQuery = trim($searchQuery . ' ' . $excludeTerms);
+                $sourceInput = 'ytsearch1:' . $finalQuery;
+
+                Log::info('Auto podcast source discovery', [
+                    'task_id' => $taskId,
+                    'query' => $finalQuery,
+                ]);
             }
 
-            $download = new Process([
+            $downloadCommand = [
                 $ytDlpBin,
                 '--no-playlist',
                 '-f',
                 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+            ];
+
+            // In auto mode, keep sources strictly podcast-style and reject match/highlight content.
+            if ($isAutoDiscovery) {
+                $downloadCommand = array_merge($downloadCommand, [
+                    '--match-title',
+                    '(?i)(podcast|obrolan|diskusi|talk\\s?show|wawancara|interview)',
+                    '--reject-title',
+                    '(?i)(pertandingan|live\\s?stream|highlight|highlights|gol\\b|goal\\b|\\bvs\\b|\\bmatch\\b)',
+                ]);
+            }
+
+            $downloadCommand = array_merge($downloadCommand, [
                 '-o',
                 $sourceTemplate,
                 $sourceInput,
             ]);
+
+            $download = new Process($downloadCommand);
             $download->setTimeout(1800);
             $download->run();
 
@@ -515,6 +551,7 @@ class AiClipperController extends Controller
                 $segments[] = [
                     'clip_number' => $clipNumber,
                     'title' => $plan['title'] ?? ($topicHint . ' - Clip ' . $clipNumber),
+                    'subtitle_text' => $plan['subtitle_text'] ?? ($plan['title'] ?? ($topicHint . ' - Clip ' . $clipNumber)),
                     'start_time' => $start,
                     'end_time' => $end,
                     'duration' => $end - $start,
@@ -528,9 +565,26 @@ class AiClipperController extends Controller
 
             $renderedClips = [];
             $renderErrors = [];
+            $targetWidth = 1080;
+            $targetHeight = 1920;
+            $portraitFilter = 'scale=' . $targetWidth . ':' . $targetHeight . ':force_original_aspect_ratio=increase,crop=' . $targetWidth . ':' . $targetHeight . ',setsar=1';
+            $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+            if (!File::exists($subtitleFont)) {
+                $subtitleFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+            }
+            $fontPart = File::exists($subtitleFont) ? 'fontfile=' . $subtitleFont . ':' : '';
+
             foreach ($segments as $segment) {
                 $clipNumber = $segment['clip_number'];
                 $tmpOutput = $tmpDir . DIRECTORY_SEPARATOR . 'clip-' . $clipNumber . '.mp4';
+                $subtitleText = $this->escapeDrawtextText((string) ($segment['subtitle_text'] ?? $segment['title'] ?? 'Podcast Clip'));
+                $subtitleFilter = 'drawtext=' . $fontPart
+                    . 'text=\'' . $subtitleText . '\':'
+                    . 'fontcolor=white:fontsize=52:'
+                    . 'borderw=3:bordercolor=black@0.85:'
+                    . 'box=1:boxcolor=black@0.38:boxborderw=20:'
+                    . 'line_spacing=8:'
+                    . 'x=(w-text_w)/2:y=h-text_h-120';
 
                 $ffmpegCommand = [
                     $ffmpegBin,
@@ -548,7 +602,20 @@ class AiClipperController extends Controller
                         '-i',
                         $watermarkPath,
                         '-filter_complex',
-                        '[1:v]scale=iw*0.2:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20',
+                        '[0:v]' . $portraitFilter . ',' . $subtitleFilter . '[sub];[1:v]scale=iw*0.2:-1[wm];[sub][wm]overlay=W-w-20:H-h-20[vout]',
+                        '-map',
+                        '[vout]',
+                        '-map',
+                        '0:a?',
+                    ]);
+                } else {
+                    $ffmpegCommand = array_merge($ffmpegCommand, [
+                        '-vf',
+                        $portraitFilter . ',' . $subtitleFilter,
+                        '-map',
+                        '0:v:0',
+                        '-map',
+                        '0:a?',
                     ]);
                 }
 
@@ -561,6 +628,8 @@ class AiClipperController extends Controller
                     '23',
                     '-c:a',
                     'aac',
+                    '-pix_fmt',
+                    'yuv420p',
                     '-movflags',
                     '+faststart',
                     $tmpOutput,
@@ -644,6 +713,30 @@ class AiClipperController extends Controller
         }
 
         return null;
+    }
+
+    private function escapeDrawtextText(string $text): string
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return 'Podcast Clip';
+        }
+
+        $text = preg_replace('/\s+/', ' ', $text);
+        $text = mb_substr($text, 0, 180);
+        $text = wordwrap($text, 28, "\n", true);
+        $text = str_replace("\n", '\n', $text);
+
+        return strtr($text, [
+            '\\' => '\\\\',
+            ':' => '\:',
+            "'" => "\\'",
+            '%' => '\%',
+            ',' => '\,',
+            ';' => '\;',
+            '[' => '\[',
+            ']' => '\]',
+        ]);
     }
 
     /**

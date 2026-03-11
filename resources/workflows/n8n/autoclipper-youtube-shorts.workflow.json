@@ -5,7 +5,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "video-clipper",
-        "responseMode": "responseNode",
+        "responseMode": "onReceived",
         "options": {}
       },
       "id": "1",
@@ -19,7 +19,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const body = $json.body ?? $json;\nconst workflowMode = body.workflow_mode ?? 'auto_trending';\nconst topicHint = body.topic_hint || 'Topik hangat';\nconst numClips = Math.min(Math.max(Number(body.num_clips || 1), 1), 10);\nconst clipDuration = Math.min(Math.max(Number(body.clip_duration || 35), 10), 120);\n\n// NOTE:\n// For real clipping, youtube_url must be an actual URL, not auto://trending.\n// If you still use auto mode, add a discovery node before this node to resolve a real video URL.\nconst youtubeUrl = body.youtube_url;\n\nconst clipsPlan = [];\nfor (let i = 0; i < numClips; i++) {\n  const clipNumber = i + 1;\n  const start = i * clipDuration;\n  const end = start + clipDuration;\n  clipsPlan.push({\n    clip_number: clipNumber,\n    title: `${topicHint} - Clip ${clipNumber}`,\n    start_time: start,\n    end_time: end,\n    duration: clipDuration,\n    reason: 'Auto planned by n8n workflow.'\n  });\n}\n\nreturn [{\n  json: {\n    task_id: Number(body.task_id),\n    workflow_mode: workflowMode,\n    youtube_url: youtubeUrl,\n    num_clips: numClips,\n    watermark_url: body.watermark_url || null,\n    callback_url: body.callback_url || 'https://clipper.dimascndraa.me/api/ai-clipper/callback',\n    render_upload_url: body.render_upload_url || 'https://clipper.dimascndraa.me/api/ai-clipper/render-upload',\n    render_api_key: body.render_api_key || '123456',\n    topic_hint: topicHint,\n    fact_check_notes: `Topik ${topicHint} divalidasi dari beberapa sumber tepercaya.`,\n    source_podcast_query: `podcast ${topicHint} indonesia`,\n    clips_plan: clipsPlan\n  }\n}];"
+        "jsCode": "const body = $json.body ?? $json;\nconst workflowMode = body.workflow_mode ?? 'auto_trending';\nconst topicHint = body.topic_hint || 'Topik hangat';\nconst numClips = Math.min(Math.max(Number(body.num_clips || 1), 1), 10);\nconst clipDuration = Math.min(Math.max(Number(body.clip_duration || 35), 10), 120);\n\n// NOTE:\n// For real clipping, youtube_url must be an actual URL, not auto://trending.\n// If you still use auto mode, add a discovery node before this node to resolve a real video URL.\nconst youtubeUrl = body.youtube_url;\n\nconst clipsPlan = [];\nfor (let i = 0; i < numClips; i++) {\n  const clipNumber = i + 1;\n  const start = i * clipDuration;\n  const end = start + clipDuration;\n  clipsPlan.push({\n    clip_number: clipNumber,\n    title: `${topicHint} - Clip ${clipNumber}`,\n    subtitle_text: `Podcast ${topicHint} - Part ${clipNumber}`,\n    start_time: start,\n    end_time: end,\n    duration: clipDuration,\n    reason: 'Auto planned by n8n workflow.'\n  });\n}\n\nconst sourcePodcastQuery = `podcast ${topicHint} indonesia -pertandingan -live -highlight -highlights -gol -goal`;\n\nreturn [{\n  json: {\n    task_id: Number(body.task_id),\n    workflow_mode: workflowMode,\n    youtube_url: youtubeUrl,\n    num_clips: numClips,\n    watermark_url: body.watermark_url || null,\n    callback_url: body.callback_url || 'https://clipper.dimascndraa.me/api/ai-clipper/callback',\n    render_upload_url: body.render_upload_url || 'https://clipper.dimascndraa.me/api/ai-clipper/render-upload',\n    render_api_key: body.render_api_key || '123456',\n    topic_hint: topicHint,\n    fact_check_notes: `Topik ${topicHint} divalidasi dari beberapa sumber tepercaya.`,\n    source_podcast_query: sourcePodcastQuery,\n    clips_plan: clipsPlan\n  }\n}];"
       },
       "id": "2",
       "name": "Prepare Topic & Clip Plan",
@@ -89,21 +89,6 @@
         1320,
         300
       ]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={\n  \"status\": \"accepted\",\n  \"message\": \"Workflow processed and callback sent\",\n  \"task_id\": {{$node[\"Prepare Callback Payload\"].json[\"task_id\"]}}\n}",
-        "options": {}
-      },
-      "id": "6",
-      "name": "Respond Accepted",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [
-        1320,
-        120
-      ]
     }
   ],
   "connections": {
@@ -145,11 +130,6 @@
         [
           {
             "node": "Callback to Laravel",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Respond Accepted",
             "type": "main",
             "index": 0
           }
