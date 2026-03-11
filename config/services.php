@@ -49,4 +49,10 @@ return [
         'default_clip_duration' => env('AUTOCLIPPER_CLIP_DURATION', 35),
     ],
 
+    'openai' => [
+        'api_key' => env('OPENAI_API_KEY'),
+        'base_url' => env('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+        'model' => env('OPENAI_MODEL', 'gpt-4o-mini'),
+    ],
+
 ];

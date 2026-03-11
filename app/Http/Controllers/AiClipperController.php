@@ -376,6 +376,8 @@ class AiClipperController extends Controller
             'source_podcast_query' => 'nullable|string',
             'source_candidate_queries' => 'nullable|array',
             'source_candidate_queries.*' => 'nullable|string|max:255',
+            'ai_enhance' => 'nullable|boolean',
+            'ai_model' => 'nullable|string|max:120',
             'face_tracking' => 'nullable|boolean',
             'face_tracking_required' => 'nullable|boolean',
             'face_tracking_smoothness' => 'nullable|numeric|min:0.5|max:0.98',
@@ -445,6 +447,31 @@ class AiClipperController extends Controller
             ], 500);
         }
 
+        $aiEnhance = $request->boolean('ai_enhance', true);
+        $aiModel = trim((string) $request->input('ai_model', ''));
+        $excludeTerms = '-pertandingan -live -highlight -highlights -gol -goal';
+        $sourcePodcastQuery = trim((string) $request->input('source_podcast_query', ''));
+        $sourceCandidateQueries = $request->input('source_candidate_queries', []);
+        $sourceCandidateQueries = is_array($sourceCandidateQueries) ? $sourceCandidateQueries : [];
+
+        if ($isAutoDiscovery) {
+            $aiPlan = $this->buildAiDiscoveryPlan(
+                topicHint: (string) $topicHint,
+                numClips: $numClips,
+                clipDuration: $defaultClipDuration,
+                excludeTerms: $excludeTerms,
+                requestedSourceQuery: $sourcePodcastQuery,
+                requestedCandidateQueries: $sourceCandidateQueries,
+                requestedClipsPlan: is_array($clipsPlan) ? $clipsPlan : [],
+                useAi: $aiEnhance,
+                aiModel: $aiModel !== '' ? $aiModel : null,
+            );
+
+            $sourcePodcastQuery = $aiPlan['source_podcast_query'];
+            $sourceCandidateQueries = $aiPlan['source_candidate_queries'];
+            $clipsPlan = $aiPlan['clips_plan'];
+        }
+
         $tmpRoot = storage_path('app/tmp/autoclipper');
         $tmpDir = $tmpRoot . DIRECTORY_SEPARATOR . Str::uuid()->toString();
         $taskDirRelative = 'autoclipper/task-' . $taskId;
@@ -459,7 +486,7 @@ class AiClipperController extends Controller
             $sourceInput = $youtubeUrl;
             $fallbackSourceInputs = [];
             if ($isAutoDiscovery) {
-                $searchQuery = trim((string) $request->input('source_podcast_query', ''));
+                $searchQuery = $sourcePodcastQuery;
                 $searchTopic = trim((string) $request->input('topic_hint', 'teknologi'));
                 if ($searchQuery === '') {
                     $searchQuery = 'podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia';
@@ -469,9 +496,7 @@ class AiClipperController extends Controller
                     $searchQuery = 'podcast ' . $searchQuery;
                 }
 
-                $excludeTerms = '-pertandingan -live -highlight -highlights -gol -goal';
-                $candidateQueriesRaw = $request->input('source_candidate_queries', []);
-                $candidateQueriesRaw = is_array($candidateQueriesRaw) ? $candidateQueriesRaw : [];
+                $candidateQueriesRaw = $sourceCandidateQueries;
                 $candidateQueries = [];
 
                 foreach ($candidateQueriesRaw as $candidateQueryRaw) {
@@ -943,7 +968,7 @@ class AiClipperController extends Controller
                 'status' => 'completed',
                 'callback_url' => $request->input('callback_url'),
                 'fact_check_notes' => $request->input('fact_check_notes'),
-                'source_podcast_query' => $request->input('source_podcast_query'),
+                'source_podcast_query' => $sourcePodcastQuery,
                 'rendered_clips' => $renderedClips,
                 'total_clips' => count($renderedClips),
                 'face_tracking' => [
@@ -969,6 +994,241 @@ class AiClipperController extends Controller
                 File::deleteDirectory($tmpDir);
             }
         }
+    }
+
+    private function buildAiDiscoveryPlan(
+        string $topicHint,
+        int $numClips,
+        int $clipDuration,
+        string $excludeTerms,
+        string $requestedSourceQuery,
+        array $requestedCandidateQueries,
+        array $requestedClipsPlan,
+        bool $useAi,
+        ?string $aiModel = null
+    ): array {
+        $topic = trim($topicHint) !== '' ? trim($topicHint) : 'teknologi';
+        $sourceQuery = $this->normalizePodcastQuery($requestedSourceQuery, $topic, $excludeTerms);
+
+        $defaultCandidates = [
+            "podcast {$topic} indonesia full episode",
+            "podcast {$topic} indonesia terbaru",
+            "podcast close the door {$topic}",
+            "podcast denny sumargo {$topic}",
+            "podcast najwa shihab {$topic}",
+            "podcast vindes {$topic}",
+            "wawancara {$topic} podcast indonesia",
+        ];
+
+        $candidateSeed = !empty($requestedCandidateQueries) ? $requestedCandidateQueries : $defaultCandidates;
+        $candidateQueries = [];
+        foreach ($candidateSeed as $candidate) {
+            $candidateQueries[] = $this->normalizePodcastQuery((string) $candidate, $topic, $excludeTerms);
+        }
+        $candidateQueries = array_values(array_unique(array_filter($candidateQueries)));
+        $candidateQueries = array_slice($candidateQueries, 0, 10);
+
+        $clipsPlan = $this->normalizeClipPlan($requestedClipsPlan, $topic, $numClips, $clipDuration);
+
+        if (!$useAi) {
+            return [
+                'source_podcast_query' => $sourceQuery,
+                'source_candidate_queries' => $candidateQueries,
+                'clips_plan' => $clipsPlan,
+            ];
+        }
+
+        $openAiKey = (string) config('services.openai.api_key', '');
+        if ($openAiKey === '') {
+            return [
+                'source_podcast_query' => $sourceQuery,
+                'source_candidate_queries' => $candidateQueries,
+                'clips_plan' => $clipsPlan,
+            ];
+        }
+
+        $model = $aiModel ?: (string) config('services.openai.model', 'gpt-4o-mini');
+        $baseUrl = rtrim((string) config('services.openai.base_url', 'https://api.openai.com/v1'), '/');
+
+        $promptPayload = [
+            'topic' => $topic,
+            'num_clips' => $numClips,
+            'clip_duration' => $clipDuration,
+            'exclude_terms' => $excludeTerms,
+            'base_source_query' => $sourceQuery,
+            'base_candidate_queries' => $candidateQueries,
+            'base_clips_plan' => $clipsPlan,
+        ];
+
+        $systemPrompt = 'You are a viral short-video producer specialized in Indonesian podcast content. Return ONLY valid JSON.';
+        $userPrompt = "Optimize this plan for higher trending potential while staying podcast-focused. "
+            . "Return JSON with keys: source_podcast_query (string), source_candidate_queries (array max 8), clips_plan (array). "
+            . "Each clips_plan item: clip_number, title, subtitle_text, start_time, end_time, duration, reason. "
+            . "Do not include non-podcast keywords like pertandingan/live/highlight/gol.\n\n"
+            . json_encode($promptPayload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        try {
+            $response = Http::baseUrl($baseUrl)
+                ->timeout(25)
+                ->withToken($openAiKey)
+                ->acceptJson()
+                ->post('/chat/completions', [
+                    'model' => $model,
+                    'temperature' => 0.6,
+                    'response_format' => ['type' => 'json_object'],
+                    'messages' => [
+                        ['role' => 'system', 'content' => $systemPrompt],
+                        ['role' => 'user', 'content' => $userPrompt],
+                    ],
+                ]);
+
+            if ($response->failed()) {
+                Log::warning('AI discovery plan request failed', [
+                    'status' => $response->status(),
+                    'body' => Str::limit((string) $response->body(), 1000),
+                ]);
+                return [
+                    'source_podcast_query' => $sourceQuery,
+                    'source_candidate_queries' => $candidateQueries,
+                    'clips_plan' => $clipsPlan,
+                ];
+            }
+
+            $content = (string) data_get($response->json(), 'choices.0.message.content', '');
+            $aiJson = $this->extractJsonFromText($content);
+            if (!$aiJson) {
+                return [
+                    'source_podcast_query' => $sourceQuery,
+                    'source_candidate_queries' => $candidateQueries,
+                    'clips_plan' => $clipsPlan,
+                ];
+            }
+
+            $aiSourceQuery = $this->normalizePodcastQuery(
+                (string) data_get($aiJson, 'source_podcast_query', $sourceQuery),
+                $topic,
+                $excludeTerms
+            );
+
+            $aiCandidateRaw = data_get($aiJson, 'source_candidate_queries', []);
+            $aiCandidateRaw = is_array($aiCandidateRaw) ? $aiCandidateRaw : [];
+            $aiCandidates = [];
+            foreach ($aiCandidateRaw as $candidate) {
+                $aiCandidates[] = $this->normalizePodcastQuery((string) $candidate, $topic, $excludeTerms);
+            }
+            $aiCandidates = array_values(array_unique(array_filter($aiCandidates)));
+            if (empty($aiCandidates)) {
+                $aiCandidates = $candidateQueries;
+            }
+            $aiCandidates = array_slice($aiCandidates, 0, 10);
+
+            $aiClipsRaw = data_get($aiJson, 'clips_plan', []);
+            $aiClipsRaw = is_array($aiClipsRaw) ? $aiClipsRaw : [];
+            $aiClips = $this->normalizeClipPlan($aiClipsRaw, $topic, $numClips, $clipDuration);
+
+            return [
+                'source_podcast_query' => $aiSourceQuery,
+                'source_candidate_queries' => $aiCandidates,
+                'clips_plan' => $aiClips,
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('AI discovery plan exception', ['message' => $e->getMessage()]);
+            return [
+                'source_podcast_query' => $sourceQuery,
+                'source_candidate_queries' => $candidateQueries,
+                'clips_plan' => $clipsPlan,
+            ];
+        }
+    }
+
+    private function normalizeClipPlan(array $plan, string $topic, int $numClips, int $clipDuration): array
+    {
+        $hooks = [
+            'MOMEN PALING PANAS',
+            'PENDAPAT PALING BERANI',
+            'INSIGHT YANG JARANG DIBAHAS',
+            'BAGIAN YANG BIKIN MIKIR',
+            'KALIMAT PALING MENOHOK',
+            'PREDIKSI PALING MENARIK',
+        ];
+        $offsets = [45, 120, 210, 300, 390, 480, 570, 660, 750, 840];
+        $safeDuration = max(20, min($clipDuration, 60));
+        $normalized = [];
+
+        for ($i = 0; $i < $numClips; $i++) {
+            $clipNumber = $i + 1;
+            $item = $plan[$i] ?? [];
+            $hook = $hooks[$i % count($hooks)];
+
+            $start = isset($item['start_time']) && is_numeric($item['start_time'])
+                ? (float) $item['start_time']
+                : (float) ($offsets[$i] ?? (45 + ($i * $safeDuration)));
+            $end = isset($item['end_time']) && is_numeric($item['end_time'])
+                ? (float) $item['end_time']
+                : ($start + $safeDuration);
+            if ($end <= $start) {
+                $end = $start + $safeDuration;
+            }
+
+            $normalized[] = [
+                'clip_number' => isset($item['clip_number']) && is_numeric($item['clip_number'])
+                    ? (int) $item['clip_number']
+                    : $clipNumber,
+                'title' => trim((string) ($item['title'] ?? ($topic . ' - ' . $hook))),
+                'subtitle_text' => trim((string) ($item['subtitle_text'] ?? ($hook . ': ' . $topic))),
+                'start_time' => round($start, 2),
+                'end_time' => round($end, 2),
+                'duration' => round($end - $start, 2),
+                'reason' => trim((string) ($item['reason'] ?? 'Segment dipilih karena hook conversation yang kuat untuk Shorts.')),
+            ];
+        }
+
+        return $normalized;
+    }
+
+    private function normalizePodcastQuery(string $query, string $topic, string $excludeTerms): string
+    {
+        $q = trim($query);
+        if ($q === '') {
+            $q = "podcast {$topic} indonesia";
+        }
+        if (!preg_match('/\bpodcast\b/i', $q)) {
+            $q = 'podcast ' . $q;
+        }
+        if (!str_contains(strtolower($q), strtolower($excludeTerms))) {
+            $q = trim($q . ' ' . $excludeTerms);
+        }
+
+        return preg_replace('/\s+/', ' ', $q) ?: $q;
+    }
+
+    private function extractJsonFromText(string $content): ?array
+    {
+        $text = trim($content);
+        if ($text === '') {
+            return null;
+        }
+
+        $decoded = json_decode($text, true);
+        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+            return $decoded;
+        }
+
+        if (preg_match('/```(?:json)?\s*(\{.*\})\s*```/is', $text, $matches)) {
+            $decoded = json_decode($matches[1], true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return $decoded;
+            }
+        }
+
+        if (preg_match('/(\{.*\})/s', $text, $matches)) {
+            $decoded = json_decode($matches[1], true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return $decoded;
+            }
+        }
+
+        return null;
     }
 
     private function resolveBinaryPath(string $binary, array $fallbacks = []): ?string
