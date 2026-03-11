@@ -374,7 +374,10 @@ class AiClipperController extends Controller
             'callback_url' => 'nullable|url',
             'fact_check_notes' => 'nullable|string',
             'source_podcast_query' => 'nullable|string',
+            'source_candidate_queries' => 'nullable|array',
+            'source_candidate_queries.*' => 'nullable|string|max:255',
             'face_tracking' => 'nullable|boolean',
+            'face_tracking_required' => 'nullable|boolean',
             'face_tracking_smoothness' => 'nullable|numeric|min:0.5|max:0.98',
             'clips_plan' => 'nullable|array',
             'clips_plan.*.clip_number' => 'nullable|integer|min:1',
@@ -404,6 +407,7 @@ class AiClipperController extends Controller
         $ytDlpConfigured = (string) config('services.n8n.ytdlp_bin', 'yt-dlp');
         $pythonConfigured = (string) config('services.n8n.python_bin', 'python3');
         $faceTrackingEnabled = $request->boolean('face_tracking', true);
+        $faceTrackingRequired = $request->boolean('face_tracking_required', false);
         $faceTrackingSmoothness = (float) $request->input('face_tracking_smoothness', 0.88);
         $faceTrackingSmoothness = max(0.5, min($faceTrackingSmoothness, 0.98));
 
@@ -413,6 +417,17 @@ class AiClipperController extends Controller
         $pythonBin = $this->resolveBinaryPath($pythonConfigured, ['/usr/bin/python3', '/usr/local/bin/python3', '/usr/bin/python']);
         $faceTrackingScript = base_path('scripts/face_track_reframe.py');
         $canUseFaceTracking = $faceTrackingEnabled && $pythonBin && File::exists($faceTrackingScript);
+
+        if ($faceTrackingRequired && !$canUseFaceTracking) {
+            return response()->json([
+                'error' => 'Face tracking is required but runtime is unavailable.',
+                'details' => [
+                    'python_bin' => $pythonBin ?: 'not found',
+                    'script' => File::exists($faceTrackingScript) ? $faceTrackingScript : 'not found',
+                ],
+                'hint' => 'Install python3 + opencv-python-headless and deploy scripts/face_track_reframe.py.',
+            ], 500);
+        }
 
         if (!$ffmpegBin || !$ffprobeBin || !$ytDlpBin) {
             return response()->json([
@@ -455,16 +470,42 @@ class AiClipperController extends Controller
                 }
 
                 $excludeTerms = '-pertandingan -live -highlight -highlights -gol -goal';
+                $candidateQueriesRaw = $request->input('source_candidate_queries', []);
+                $candidateQueriesRaw = is_array($candidateQueriesRaw) ? $candidateQueriesRaw : [];
+                $candidateQueries = [];
+
+                foreach ($candidateQueriesRaw as $candidateQueryRaw) {
+                    $candidateQuery = trim((string) $candidateQueryRaw);
+                    if ($candidateQuery === '') {
+                        continue;
+                    }
+                    if (!preg_match('/\bpodcast\b/i', $candidateQuery)) {
+                        $candidateQuery = 'podcast ' . $candidateQuery;
+                    }
+                    $candidateQueries[] = trim($candidateQuery . ' ' . $excludeTerms);
+                }
+
                 $finalQuery = trim($searchQuery . ' ' . $excludeTerms);
-                $sourceInput = 'ytsearch5:' . $finalQuery;
-                $fallbackSourceInputs = [
-                    'ytsearch10:podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia',
-                    'ytsearch10:wawancara podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia',
-                ];
+                if (empty($candidateQueries)) {
+                    $candidateQueries = [
+                        $finalQuery,
+                        'podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia ' . $excludeTerms,
+                        'wawancara podcast ' . ($searchTopic !== '' ? $searchTopic : 'teknologi') . ' indonesia ' . $excludeTerms,
+                    ];
+                } else {
+                    array_unshift($candidateQueries, $finalQuery);
+                    $candidateQueries = array_values(array_unique($candidateQueries));
+                }
+
+                $sourceInput = 'ytsearch5:' . $candidateQueries[0];
+                foreach (array_slice($candidateQueries, 1, 5) as $query) {
+                    $fallbackSourceInputs[] = 'ytsearch10:' . $query;
+                }
 
                 Log::info('Auto podcast source discovery', [
                     'task_id' => $taskId,
-                    'query' => $finalQuery,
+                    'query' => $candidateQueries[0],
+                    'candidate_queries' => $candidateQueries,
                 ]);
             }
 
@@ -746,6 +787,17 @@ class AiClipperController extends Controller
                         }
                     }
 
+                    if ($faceTrackingRequired && !$useTrackedVideo) {
+                        $attemptErrors[] = [
+                            'resolution' => $targetWidth . 'x' . $targetHeight,
+                            'preset' => (string) $profile['preset'],
+                            'face_tracking' => false,
+                            'face_tracking_error' => $trackingError ?: 'Face tracking output not generated.',
+                            'error' => 'Face tracking is required for this run.',
+                        ];
+                        continue;
+                    }
+
                     $ffmpegCommand = [$ffmpegBin, '-y'];
 
                     if ($useTrackedVideo) {
@@ -864,6 +916,11 @@ class AiClipperController extends Controller
             if (empty($renderedClips)) {
                 return response()->json([
                     'error' => 'Failed to render all requested clips.',
+                    'face_tracking' => [
+                        'requested' => $faceTrackingEnabled,
+                        'required' => $faceTrackingRequired,
+                        'available' => $canUseFaceTracking,
+                    ],
                     'render_errors' => $renderErrors,
                 ], 500);
             }
@@ -876,6 +933,13 @@ class AiClipperController extends Controller
                 'source_podcast_query' => $request->input('source_podcast_query'),
                 'rendered_clips' => $renderedClips,
                 'total_clips' => count($renderedClips),
+                'face_tracking' => [
+                    'requested' => $faceTrackingEnabled,
+                    'required' => $faceTrackingRequired,
+                    'available' => $canUseFaceTracking,
+                    'python' => $pythonBin ?: null,
+                    'script' => File::exists($faceTrackingScript) ? $faceTrackingScript : null,
+                ],
                 'render_errors' => $renderErrors,
             ]);
         } catch (\Throwable $e) {
