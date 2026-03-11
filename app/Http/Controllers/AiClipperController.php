@@ -775,6 +775,19 @@ class AiClipperController extends Controller
                             (string) $targetHeight,
                             '--smooth',
                             (string) $faceTrackingSmoothness,
+                            '--detect-scale',
+                            '0.4',
+                            '--detect-interval',
+                            '4',
+                        ]);
+                        $track->setEnv([
+                            'OMP_NUM_THREADS' => '1',
+                            'OPENBLAS_NUM_THREADS' => '1',
+                            'MKL_NUM_THREADS' => '1',
+                            'NUMEXPR_NUM_THREADS' => '1',
+                            'VECLIB_MAXIMUM_THREADS' => '1',
+                            'OPENCV_FOR_THREADS_NUM' => '1',
+                            'OPENCV_OPENCL_RUNTIME' => 'disabled',
                         ]);
                         $track->setTimeout(900);
                         $track->run();

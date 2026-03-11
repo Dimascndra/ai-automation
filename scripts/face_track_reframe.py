@@ -23,7 +23,18 @@ def main():
     parser.add_argument("--width", type=int, default=1080, help="Output width")
     parser.add_argument("--height", type=int, default=1920, help="Output height")
     parser.add_argument("--smooth", type=float, default=0.88, help="Smoothing factor [0.5..0.98]")
+    parser.add_argument("--detect-scale", type=float, default=0.5, help="Face detection resize scale [0.2..1.0]")
+    parser.add_argument("--detect-interval", type=int, default=3, help="Run detector every N frames")
     args = parser.parse_args()
+
+    # Keep tracker low-resource on small VPS/shared hosting.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("OPENCV_FOR_THREADS_NUM", "1")
+    os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
 
     try:
         import cv2
@@ -31,11 +42,26 @@ def main():
         print(f"OpenCV import failed: {exc}", file=sys.stderr)
         return 2
 
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    try:
+        cv2.setUseOptimized(False)
+    except Exception:
+        pass
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+
     in_path = args.input
     out_path = args.output
     out_w = int(args.width)
     out_h = int(args.height)
     smooth = clamp(float(args.smooth), 0.5, 0.98)
+    detect_scale = clamp(float(args.detect_scale), 0.2, 1.0)
+    detect_interval = max(1, int(args.detect_interval))
 
     if not os.path.isfile(in_path):
         print("Input file not found", file=sys.stderr)
@@ -89,7 +115,6 @@ def main():
     y = (src_h - crop_h) / 2.0
     frames = 0
     faces_detected = 0
-    detect_interval = 2
 
     while True:
         ok, frame = cap.read()
@@ -100,8 +125,16 @@ def main():
         desired_y = y
 
         if frames % detect_interval == 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            min_size = max(40, int(min(src_w, src_h) * 0.08))
+            proc = frame
+            if detect_scale < 0.99:
+                proc = cv2.resize(
+                    frame,
+                    (max(1, int(src_w * detect_scale)), max(1, int(src_h * detect_scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
+            min_size = max(20, int(min(gray.shape[1], gray.shape[0]) * 0.08))
             faces = face_cascade.detectMultiScale(
                 gray,
                 scaleFactor=1.1,
@@ -113,6 +146,11 @@ def main():
             if len(faces) > 0:
                 faces_detected += 1
                 fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+                if detect_scale < 0.99:
+                    fx = fx / detect_scale
+                    fy = fy / detect_scale
+                    fw = fw / detect_scale
+                    fh = fh / detect_scale
                 cx = fx + (fw / 2.0)
                 cy = fy + (fh / 2.0)
                 desired_x = clamp(cx - (crop_w / 2.0), 0.0, float(src_w - crop_w))
@@ -146,6 +184,8 @@ def main():
                 "frames": frames,
                 "faces_detected": faces_detected,
                 "smooth": smooth,
+                "detect_scale": detect_scale,
+                "detect_interval": detect_interval,
                 "output": out_path,
             }
         )
